@@ -2,10 +2,19 @@
 Description=Nix Daemon Socket
 Before=multi-user.target
 RequiresMountsFor=@storedir@
-ConditionPathIsReadWrite=@localstatedir@/nix/daemon-socket
 
-[Socket]
-ListenStream=@localstatedir@/nix/daemon-socket/socket
+# For a local socket add the following under nix-daemon.socket.d
+#
+# [Unit]
+# ConditionPathIsReadWrite=@localstatedir@/nix/daemon-socket
+#
+# [Socket]
+# ListenStream=@localstatedir@/nix/daemon-socket/socket
+
+# For a remote socket add the following under nix-daemon.socket.d
+#
+# [Socket]
+# ListenStream=0.0.0.0:806
 
 [Install]
 WantedBy=sockets.target
