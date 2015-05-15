@@ -15,6 +15,7 @@
 
 #include <iostream>
 #include <unistd.h>
+#include <netdb.h>
 #include <cstring>
 
 namespace nix {
@@ -54,9 +55,9 @@ void RemoteStore::openConnection(bool reserveSpace)
     if (remoteMode == "daemon")
         /* Connect to a daemon that does the privileged work for
            us. */
-        connectToDaemon();
+        connectToDaemonUNIX();
     else
-        throw Error(format("invalid setting for NIX_REMOTE, ‘%1%’") % remoteMode);
+        connectToDaemonINET(remoteMode);
 
     from.fd = fdSocket;
     to.fd = fdSocket;
@@ -95,7 +96,7 @@ void RemoteStore::openConnection(bool reserveSpace)
 }
 
 
-void RemoteStore::connectToDaemon()
+void RemoteStore::connectToDaemonUNIX()
 {
     fdSocket = socket(PF_UNIX, SOCK_STREAM, 0);
     if (fdSocket == -1)
@@ -125,6 +126,53 @@ void RemoteStore::connectToDaemon()
 
     if (fchdir(fdPrevDir) == -1)
         throw SysError("couldn't change back to previous directory");
+}
+
+
+
+void RemoteStore::connectToDaemonINET(const string & remoteAddress)
+{
+    size_t remoteColonOffset = remoteAddress.find(':');
+    if (remoteColonOffset == string::npos)
+        throw Error(format("invalid daemon address ‘%1%’ (should be daemon or host:port)") % remoteAddress);
+
+    string remoteHost = remoteAddress.substr(0,remoteColonOffset);
+    string remoteService = remoteAddress.substr(remoteColonOffset+1);
+
+    addrinfo addrHints;
+    addrinfo* addrResults;
+
+    memset(&addrHints,0,sizeof(addrHints));
+    addrHints.ai_flags = AI_ADDRCONFIG | AI_V4MAPPED;
+    addrHints.ai_family = AF_UNSPEC;
+    addrHints.ai_socktype = SOCK_STREAM;
+    addrHints.ai_protocol = 0;
+
+    int result = getaddrinfo(remoteHost.c_str(), remoteService.c_str(), &addrHints, &addrResults);
+    if (result != 0)
+        throw Error(format("unable to lookup daemon address ‘%1%’") % remoteAddress);
+    std::unique_ptr<addrinfo,void (&)(addrinfo *)> addrResults_gc(addrResults,freeaddrinfo);
+
+    int remoteSocket;
+    addrinfo* addrIter;
+    for (addrIter = addrResults; addrIter; addrIter = addrIter->ai_next) {
+        remoteSocket = socket(addrIter->ai_family, addrIter->ai_socktype, addrIter->ai_protocol);
+        if (remoteSocket == -1)
+            continue;
+
+        int result = connect(remoteSocket, addrIter->ai_addr, addrIter->ai_addrlen);
+        if (result == -1) {
+            close(remoteSocket);
+            continue;
+        }
+
+        fdSocket = remoteSocket;
+        break;
+    }
+    if (addrIter == 0)
+        throw Error(format("unable to connect to daemon at ‘%1%’") % remoteAddress);
+
+    fdSocket = remoteSocket;
 }
 
 

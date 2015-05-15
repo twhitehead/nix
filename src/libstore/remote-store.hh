@@ -96,7 +96,8 @@ private:
 
     void processStderr(Sink * sink = 0, Source * source = 0);
 
-    void connectToDaemon();
+    void connectToDaemonUNIX();
+    void connectToDaemonINET(const string & remoteAddress);
 
     void setOptions();
 };
