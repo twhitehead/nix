@@ -149,10 +149,19 @@ Path dirOf(const Path & path)
 
 string baseNameOf(const Path & path)
 {
-    Path::size_type pos = path.rfind('/');
+    if (path.empty())
+        return string("");
+
+    Path::size_type last = path.length() - 1;
+    if (path[last] == '/' && last > 0)
+        last -= 1;
+
+    Path::size_type pos = path.rfind('/', last);
     if (pos == string::npos)
-        throw Error(format("invalid file name ‘%1%’") % path);
-    return string(path, pos + 1);
+        pos = 0;
+    else
+        pos += 1;
+    return string(path, pos, last - pos + 1);
 }
 
 
@@ -477,12 +486,24 @@ void printMsg_(Verbosity level, const FormatOrString & fs)
 {
     checkInterrupt();
     if (level > verbosity) return;
+
     string prefix;
     if (logType == ltPretty)
         for (int i = 0; i < nestingLevel; i++)
             prefix += "|   ";
     else if (logType == ltEscapes && level != lvlInfo)
         prefix = "\033[" + escVerbosity(level) + "s";
+    else if (logType == ltSystemd) {
+        char c;
+        switch (level) {
+            case lvlError: c = '3'; break;
+            case lvlInfo: c = '5'; break;
+            case lvlTalkative: case lvlChatty: c = '6'; break;
+            default: c = '7';
+        }
+        prefix = string("<") + c + ">";
+    }
+
     string s = (format("%1%%2%\n") % prefix % fs.s).str();
     if (!isatty(STDERR_FILENO)) s = filterANSIEscapes(s);
     writeToStderr(s);
@@ -927,10 +948,10 @@ pid_t startProcess(std::function<void()> fun, const ProcessOptions & options)
 }
 
 
-std::vector<const char *> stringsToCharPtrs(const Strings & ss)
+std::vector<char *> stringsToCharPtrs(const Strings & ss)
 {
-    std::vector<const char *> res;
-    for (auto & s : ss) res.push_back(s.c_str());
+    std::vector<char *> res;
+    for (auto & s : ss) res.push_back((char *) s.c_str());
     res.push_back(0);
     return res;
 }
@@ -942,41 +963,40 @@ string runProgram(Path program, bool searchPath, const Strings & args,
     checkInterrupt();
 
     /* Create a pipe. */
-    Pipe stdout, stdin;
-    stdout.create();
-    if (!input.empty()) stdin.create();
+    Pipe out, in;
+    out.create();
+    if (!input.empty()) in.create();
 
     /* Fork. */
     Pid pid = startProcess([&]() {
-        if (dup2(stdout.writeSide, STDOUT_FILENO) == -1)
+        if (dup2(out.writeSide, STDOUT_FILENO) == -1)
             throw SysError("dupping stdout");
         if (!input.empty()) {
-            if (dup2(stdin.readSide, STDIN_FILENO) == -1)
+            if (dup2(in.readSide, STDIN_FILENO) == -1)
                 throw SysError("dupping stdin");
         }
 
         Strings args_(args);
         args_.push_front(program);
-        auto cargs = stringsToCharPtrs(args_);
 
         if (searchPath)
-            execvp(program.c_str(), (char * *) &cargs[0]);
+            execvp(program.c_str(), stringsToCharPtrs(args_).data());
         else
-            execv(program.c_str(), (char * *) &cargs[0]);
+            execv(program.c_str(), stringsToCharPtrs(args_).data());
 
         throw SysError(format("executing ‘%1%’") % program);
     });
 
-    stdout.writeSide.close();
+    out.writeSide.close();
 
     /* FIXME: This can deadlock if the input is too long. */
     if (!input.empty()) {
-        stdin.readSide.close();
-        writeFull(stdin.writeSide, input);
-        stdin.writeSide.close();
+        in.readSide.close();
+        writeFull(in.writeSide, input);
+        in.writeSide.close();
     }
 
-    string result = drainFD(stdout.readSide);
+    string result = drainFD(out.readSide);
 
     /* Wait for the child to finish. */
     int status = pid.wait(true);
@@ -1061,9 +1081,9 @@ template vector<string> tokenizeString(const string & s, const string & separato
 string concatStringsSep(const string & sep, const Strings & ss)
 {
     string s;
-    foreach (Strings::const_iterator, i, ss) {
+    for (auto & i : ss) {
         if (s.size() != 0) s += sep;
-        s += *i;
+        s += i;
     }
     return s;
 }
@@ -1072,9 +1092,9 @@ string concatStringsSep(const string & sep, const Strings & ss)
 string concatStringsSep(const string & sep, const StringSet & ss)
 {
     string s;
-    foreach (StringSet::const_iterator, i, ss) {
+    for (auto & i : ss) {
         if (s.size() != 0) s += sep;
-        s += *i;
+        s += i;
     }
     return s;
 }
@@ -1093,6 +1113,20 @@ string trim(const string & s, const string & whitespace)
     if (i == string::npos) return "";
     auto j = s.find_last_not_of(whitespace);
     return string(s, i, j == string::npos ? j : j - i + 1);
+}
+
+
+string replaceStrings(const std::string & s,
+    const std::string & from, const std::string & to)
+{
+    if (from.empty()) return s;
+    string res = s;
+    size_t pos = 0;
+    while ((pos = res.find(from, pos)) != std::string::npos) {
+        res.replace(pos, from.size(), to);
+        pos += to.size();
+    }
+    return res;
 }
 
 

@@ -1,5 +1,6 @@
 #pragma once
 
+#include "attr-set.hh"
 #include "value.hh"
 #include "nixexpr.hh"
 #include "symbol-table.hh"
@@ -16,70 +17,6 @@ namespace nix {
 
 
 class EvalState;
-
-
-struct Attr
-{
-    Symbol name;
-    Value * value;
-    Pos * pos;
-    Attr(Symbol name, Value * value, Pos * pos = &noPos)
-        : name(name), value(value), pos(pos) { };
-    Attr() : pos(&noPos) { };
-    bool operator < (const Attr & a) const
-    {
-        return name < a.name;
-    }
-};
-
-
-class Bindings
-{
-public:
-    typedef uint32_t size_t;
-
-private:
-    size_t size_, capacity_;
-    Attr attrs[0];
-
-    Bindings(size_t capacity) : size_(0), capacity_(capacity) { }
-    Bindings(const Bindings & bindings) = delete;
-
-public:
-    size_t size() const { return size_; }
-
-    bool empty() const { return !size_; }
-
-    typedef Attr * iterator;
-
-    void push_back(const Attr & attr)
-    {
-        assert(size_ < capacity_);
-        attrs[size_++] = attr;
-    }
-
-    iterator find(const Symbol & name)
-    {
-        Attr key(name, 0);
-        iterator i = std::lower_bound(begin(), end(), key);
-        if (i != end() && i->name == name) return i;
-        return end();
-    }
-
-    iterator begin() { return &attrs[0]; }
-    iterator end() { return &attrs[size_]; }
-
-    Attr & operator[](size_t pos)
-    {
-        return attrs[pos];
-    }
-
-    void sort();
-
-    size_t capacity() { return capacity_; }
-
-    friend class EvalState;
-};
 
 
 typedef void (* PrimOpFun) (EvalState & state, const Pos & pos, Value * * args, Value & v);
@@ -137,11 +74,13 @@ public:
 
     /* If set, force copying files to the Nix store even if they
        already exist there. */
-    bool repair;
+    bool repair = false;
 
     /* If set, don't allow access to files outside of the Nix search
        path or to environment variables. */
     bool restricted;
+
+    Value vEmptySet;
 
 private:
     SrcToStore srcToStore;
@@ -197,7 +136,7 @@ public:
        of the evaluation of the thunk.  If `v' is a delayed function
        application, call the function and overwrite `v' with the
        result.  Otherwise, this is a no-op. */
-    inline void forceValue(Value & v);
+    inline void forceValue(Value & v, const Pos & pos = noPos);
 
     /* Force a value, then recursively force list elements and
        attributes. */
@@ -244,7 +183,7 @@ public:
 
 private:
 
-    unsigned int baseEnvDispl;
+    unsigned int baseEnvDispl = 0;
 
     void createBaseEnv();
 
@@ -290,7 +229,7 @@ public:
     Bindings * allocBindings(Bindings::size_t capacity);
 
     void mkList(Value & v, unsigned int length);
-    void mkAttrs(Value & v, unsigned int expected);
+    void mkAttrs(Value & v, unsigned int capacity);
     void mkThunk_(Value & v, Expr * expr);
     void mkPos(Value & v, Pos * pos);
 
@@ -301,17 +240,17 @@ public:
 
 private:
 
-    unsigned long nrEnvs;
-    unsigned long nrValuesInEnvs;
-    unsigned long nrValues;
-    unsigned long nrListElems;
-    unsigned long nrAttrsets;
-    unsigned long nrAttrsInAttrsets;
-    unsigned long nrOpUpdates;
-    unsigned long nrOpUpdateValuesCopied;
-    unsigned long nrListConcats;
-    unsigned long nrPrimOpCalls;
-    unsigned long nrFunctionCalls;
+    unsigned long nrEnvs = 0;
+    unsigned long nrValuesInEnvs = 0;
+    unsigned long nrValues = 0;
+    unsigned long nrListElems = 0;
+    unsigned long nrAttrsets = 0;
+    unsigned long nrAttrsInAttrsets = 0;
+    unsigned long nrOpUpdates = 0;
+    unsigned long nrOpUpdateValuesCopied = 0;
+    unsigned long nrListConcats = 0;
+    unsigned long nrPrimOpCalls = 0;
+    unsigned long nrFunctionCalls = 0;
 
     bool countCalls;
 

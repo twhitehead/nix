@@ -5,20 +5,9 @@ with import <nix/config.nix>;
 assert (outputHash != "" && outputHashAlgo != "")
     || md5 != "" || sha1 != "" || sha256 != "";
 
-let
-
-  builder = builtins.toFile "fetchurl.sh"
-    (''
-      echo "downloading $url into $out"
-      ${curl} --fail --location --max-redirs 20 --insecure "$url" > "$out"
-    '' + (if executable then "${coreutils}/chmod +x $out" else ""));
-
-in
-
 derivation {
   name = baseNameOf (toString url);
-  builder = shell;
-  args = [ "-e" builder ];
+  builder = "builtin:fetchurl";
 
   # New-style output content requirements.
   outputHashAlgo = if outputHashAlgo != "" then outputHashAlgo else
@@ -27,7 +16,7 @@ derivation {
       if sha256 != "" then sha256 else if sha1 != "" then sha1 else md5;
   outputHashMode = if executable then "recursive" else "flat";
 
-  inherit system url;
+  inherit system url executable;
 
   # No need to double the amount of network traffic
   preferLocalBuild = true;
@@ -39,6 +28,4 @@ derivation {
     # by definition pure.
     "http_proxy" "https_proxy" "ftp_proxy" "all_proxy" "no_proxy"
   ];
-
-  inherit chrootDeps;
 }

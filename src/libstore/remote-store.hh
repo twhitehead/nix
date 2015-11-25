@@ -67,6 +67,9 @@ public:
 
     void buildPaths(const PathSet & paths, BuildMode buildMode);
 
+    BuildResult buildDerivation(const Path & drvPath, const BasicDerivation & drv,
+        BuildMode buildMode) override;
+
     void ensurePath(const Path & path);
 
     void addTempRoot(const Path & path);
@@ -85,6 +88,7 @@ public:
 
     void optimiseStore();
 
+    bool verifyStore(bool checkContents, bool repair);
 private:
     AutoCloseFD fdSocket;
     FdSink to;

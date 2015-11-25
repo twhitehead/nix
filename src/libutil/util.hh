@@ -15,13 +15,6 @@
 namespace nix {
 
 
-#define foreach(it_type, it, collection)                                \
-    for (it_type it = (collection).begin(); it != (collection).end(); ++it)
-
-#define foreach_reverse(it_type, it, collection)                                \
-    for (it_type it = (collection).rbegin(); it != (collection).rend(); ++it)
-
-
 /* Return an environment variable. */
 string getEnv(const string & key, const string & def = "");
 
@@ -129,7 +122,8 @@ T singleton(const A & a)
 typedef enum {
     ltPretty,   /* nice, nested output */
     ltEscapes,  /* nesting indicated using escape codes (for log2xml) */
-    ltFlat      /* no nesting */
+    ltFlat,     /* no nesting */
+    ltSystemd,  /* use systemd severity prefixes */
 } LogType;
 
 extern LogType logType;
@@ -295,7 +289,7 @@ MakeError(ExecError, Error)
 /* Convert a list of strings to a null-terminated vector of char
    *'s. The result must not be accessed beyond the lifetime of the
    list of strings. */
-std::vector<const char *> stringsToCharPtrs(const Strings & ss);
+std::vector<char *> stringsToCharPtrs(const Strings & ss);
 
 /* Close all file descriptors except stdin, stdout, stderr, and those
    listed in the given set.  Good practice in child processes. */
@@ -339,6 +333,11 @@ string chomp(const string & s);
 
 /* Remove whitespace from the start and end of a string. */
 string trim(const string & s, const string & whitespace = " \n\r\t");
+
+
+/* Replace all occurrences of a string inside another string. */
+string replaceStrings(const std::string & s,
+    const std::string & from, const std::string & to);
 
 
 /* Convert the exit status of a child as returned by wait() into an

@@ -90,6 +90,7 @@ static void setLogType(string lt)
     if (lt == "pretty") logType = ltPretty;
     else if (lt == "escapes") logType = ltEscapes;
     else if (lt == "flat") logType = ltFlat;
+    else if (lt == "systemd") logType = ltSystemd;
     else throw UsageError("unknown log type");
 }
 
@@ -115,6 +116,9 @@ void initNix()
 #endif
 
     std::ios::sync_with_stdio(false);
+
+    if (getEnv("IN_SYSTEMD") == "1")
+        logType = ltSystemd;
 
     settings.processEnvironment();
     settings.loadConfFile();
@@ -239,6 +243,20 @@ void parseCmdLine(int argc, char * * argv,
 void printVersion(const string & programName)
 {
     std::cout << format("%1% (Nix) %2%") % programName % nixVersion << std::endl;
+    if (verbosity > lvlInfo) {
+        Strings cfg;
+#if HAVE_BOEHMGC
+        cfg.push_back("gc");
+#endif
+#if HAVE_SODIUM
+        cfg.push_back("signed-caches");
+#endif
+        std::cout << "Features: " << concatStringsSep(", ", cfg) << "\n";
+        std::cout << "Configuration file: " << settings.nixConfDir + "/nix.conf" << "\n";
+        std::cout << "Store directory: " << settings.nixStore << "\n";
+        std::cout << "State directory: " << settings.nixStateDir << "\n";
+        std::cout << "Database directory: " << settings.nixDBPath << "\n";
+    }
     throw Exit();
 }
 
@@ -339,6 +357,21 @@ RunPager::~RunPager()
     } catch (...) {
         ignoreException();
     }
+}
+
+
+string showBytes(unsigned long long bytes)
+{
+    return (format("%.2f MiB") % (bytes / (1024.0 * 1024.0))).str();
+}
+
+
+PrintFreed::~PrintFreed()
+{
+    if (show)
+        std::cout << format("%1% store paths deleted, %2% freed\n")
+            % results.paths.size()
+            % showBytes(results.bytesFreed);
 }
 
 

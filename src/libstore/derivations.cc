@@ -3,6 +3,7 @@
 #include "globals.hh"
 #include "util.hh"
 #include "misc.hh"
+#include "worker-protocol.hh"
 
 
 namespace nix {
@@ -31,8 +32,8 @@ Path writeDerivation(StoreAPI & store,
 {
     PathSet references;
     references.insert(drv.inputSrcs.begin(), drv.inputSrcs.end());
-    foreach (DerivationInputs::const_iterator, i, drv.inputDrvs)
-        references.insert(i->first);
+    for (auto & i : drv.inputDrvs)
+        references.insert(i.first);
     /* Note that the outputs of a derivation are *not* references
        (that can be missing (of course) and should not necessarily be
        held during a garbage collection). */
@@ -155,21 +156,21 @@ string unparseDerivation(const Derivation & drv)
     s += "Derive([";
 
     bool first = true;
-    foreach (DerivationOutputs::const_iterator, i, drv.outputs) {
+    for (auto & i : drv.outputs) {
         if (first) first = false; else s += ',';
-        s += '('; printString(s, i->first);
-        s += ','; printString(s, i->second.path);
-        s += ','; printString(s, i->second.hashAlgo);
-        s += ','; printString(s, i->second.hash);
+        s += '('; printString(s, i.first);
+        s += ','; printString(s, i.second.path);
+        s += ','; printString(s, i.second.hashAlgo);
+        s += ','; printString(s, i.second.hash);
         s += ')';
     }
 
     s += "],[";
     first = true;
-    foreach (DerivationInputs::const_iterator, i, drv.inputDrvs) {
+    for (auto & i : drv.inputDrvs) {
         if (first) first = false; else s += ',';
-        s += '('; printString(s, i->first);
-        s += ','; printStrings(s, i->second.begin(), i->second.end());
+        s += '('; printString(s, i.first);
+        s += ','; printStrings(s, i.second.begin(), i.second.end());
         s += ')';
     }
 
@@ -182,10 +183,10 @@ string unparseDerivation(const Derivation & drv)
 
     s += ",[";
     first = true;
-    foreach (StringPairs::const_iterator, i, drv.env) {
+    for (auto & i : drv.env) {
         if (first) first = false; else s += ',';
-        s += '('; printString(s, i->first);
-        s += ','; printString(s, i->second);
+        s += '('; printString(s, i.first);
+        s += ','; printString(s, i.second);
         s += ')';
     }
 
@@ -246,15 +247,15 @@ Hash hashDerivationModulo(StoreAPI & store, Derivation drv)
     /* For other derivations, replace the inputs paths with recursive
        calls to this function.*/
     DerivationInputs inputs2;
-    foreach (DerivationInputs::const_iterator, i, drv.inputDrvs) {
-        Hash h = drvHashes[i->first];
+    for (auto & i : drv.inputDrvs) {
+        Hash h = drvHashes[i.first];
         if (h.type == htUnknown) {
-            assert(store.isValidPath(i->first));
-            Derivation drv2 = readDerivation(i->first);
+            assert(store.isValidPath(i.first));
+            Derivation drv2 = readDerivation(i.first);
             h = hashDerivationModulo(store, drv2);
-            drvHashes[i->first] = h;
+            drvHashes[i.first] = h;
         }
-        inputs2[printHash(h)] = i->second;
+        inputs2[printHash(h)] = i.second;
     }
     drv.inputDrvs = inputs2;
 
@@ -282,6 +283,55 @@ Path makeDrvPathWithOutputs(const Path & drvPath, const std::set<string> & outpu
 bool wantOutput(const string & output, const std::set<string> & wanted)
 {
     return wanted.empty() || wanted.find(output) != wanted.end();
+}
+
+
+PathSet outputPaths(const BasicDerivation & drv)
+{
+    PathSet paths;
+    for (auto & i : drv.outputs)
+        paths.insert(i.second.path);
+    return paths;
+}
+
+
+Source & operator >> (Source & in, BasicDerivation & drv)
+{
+    drv.outputs.clear();
+    auto nr = readInt(in);
+    for (unsigned int n = 0; n < nr; n++) {
+        auto name = readString(in);
+        DerivationOutput o;
+        in >> o.path >> o.hashAlgo >> o.hash;
+        assertStorePath(o.path);
+        drv.outputs[name] = o;
+    }
+
+    drv.inputSrcs = readStorePaths<PathSet>(in);
+    in >> drv.platform >> drv.builder;
+    drv.args = readStrings<Strings>(in);
+
+    nr = readInt(in);
+    for (unsigned int n = 0; n < nr; n++) {
+        auto key = readString(in);
+        auto value = readString(in);
+        drv.env[key] = value;
+    }
+
+    return in;
+}
+
+
+Sink & operator << (Sink & out, const BasicDerivation & drv)
+{
+    out << drv.outputs.size();
+    for (auto & i : drv.outputs)
+        out << i.first << i.second.path << i.second.hashAlgo << i.second.hash;
+    out << drv.inputSrcs << drv.platform << drv.builder << drv.args;
+    out << drv.env.size();
+    for (auto & i : drv.env)
+        out << i.first << i.second;
+    return out;
 }
 
 

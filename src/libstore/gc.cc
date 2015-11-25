@@ -350,15 +350,14 @@ static void addAdditionalRoots(StoreAPI & store, PathSet & roots)
 
     StringSet paths = tokenizeString<StringSet>(result, "\n");
 
-    foreach (StringSet::iterator, i, paths) {
-        if (isInStore(*i)) {
-            Path path = toStorePath(*i);
+    for (auto & i : paths)
+        if (isInStore(i)) {
+            Path path = toStorePath(i);
             if (roots.find(path) == roots.end() && store.isValidPath(path)) {
                 debug(format("got additional root ‘%1%’") % path);
                 roots.insert(path);
             }
         }
-    }
 }
 
 
@@ -376,6 +375,7 @@ struct LocalStore::GCState
     bool gcKeepOutputs;
     bool gcKeepDerivations;
     unsigned long long bytesInvalidated;
+    bool moveToTrash = true;
     Path trashDir;
     bool shouldDelete;
     GCState(GCResults & results_) : results(results_), bytesInvalidated(0) { }
@@ -407,8 +407,8 @@ void LocalStore::deletePathRecursive(GCState & state, const Path & path)
     if (isValidPath(path)) {
         PathSet referrers;
         queryReferrers(path, referrers);
-        foreach (PathSet::iterator, i, referrers)
-            if (*i != path) deletePathRecursive(state, *i);
+        for (auto & i : referrers)
+            if (i != path) deletePathRecursive(state, i);
         size = queryPathInfo(path).narSize;
         invalidatePathChecked(path);
     }
@@ -428,16 +428,23 @@ void LocalStore::deletePathRecursive(GCState & state, const Path & path)
        not holding the global GC lock) we can delete the path without
        being afraid that the path has become alive again.  Otherwise
        delete it right away. */
-    if (S_ISDIR(st.st_mode)) {
+    if (state.moveToTrash && S_ISDIR(st.st_mode)) {
         // Estimate the amount freed using the narSize field.  FIXME:
         // if the path was not valid, need to determine the actual
         // size.
-        state.bytesInvalidated += size;
-        if (chmod(path.c_str(), st.st_mode | S_IWUSR) == -1)
-            throw SysError(format("making ‘%1%’ writable") % path);
-        Path tmp = state.trashDir + "/" + baseNameOf(path);
-        if (rename(path.c_str(), tmp.c_str()))
-            throw SysError(format("unable to rename ‘%1%’ to ‘%2%’") % path % tmp);
+        try {
+            if (chmod(path.c_str(), st.st_mode | S_IWUSR) == -1)
+                throw SysError(format("making ‘%1%’ writable") % path);
+            Path tmp = state.trashDir + "/" + baseNameOf(path);
+            if (rename(path.c_str(), tmp.c_str()))
+                throw SysError(format("unable to rename ‘%1%’ to ‘%2%’") % path % tmp);
+            state.bytesInvalidated += size;
+        } catch (SysError & e) {
+            if (e.errNo == ENOSPC) {
+                printMsg(lvlInfo, format("note: can't create move ‘%1%’: %2%") % path % e.msg());
+                deleteGarbage(state, path);
+            }
+        }
     } else
         deleteGarbage(state, path);
 
@@ -479,22 +486,22 @@ bool LocalStore::canReachRoot(GCState & state, PathSet & visited, const Path & p
        don't delete the derivation if any of the outputs are alive. */
     if (state.gcKeepDerivations && isDerivation(path)) {
         PathSet outputs = queryDerivationOutputs(path);
-        foreach (PathSet::iterator, i, outputs)
-            if (isValidPath(*i) && queryDeriver(*i) == path)
-                incoming.insert(*i);
+        for (auto & i : outputs)
+            if (isValidPath(i) && queryDeriver(i) == path)
+                incoming.insert(i);
     }
 
     /* If gc-keep-outputs is set, then don't delete this path if there
        are derivers of this path that are not garbage. */
     if (state.gcKeepOutputs) {
         PathSet derivers = queryValidDerivers(path);
-        foreach (PathSet::iterator, i, derivers)
-            incoming.insert(*i);
+        for (auto & i : derivers)
+            incoming.insert(i);
     }
 
-    foreach (PathSet::iterator, i, incoming)
-        if (*i != path)
-            if (canReachRoot(state, visited, *i)) {
+    for (auto & i : incoming)
+        if (i != path)
+            if (canReachRoot(state, visited, i)) {
                 state.alive.insert(path);
                 return true;
             }
@@ -614,7 +621,7 @@ void LocalStore::collectGarbage(const GCOptions & options, GCResults & results)
     printMsg(lvlError, format("finding garbage collector roots..."));
     Roots rootMap = options.ignoreLiveness ? Roots() : findRoots();
 
-    foreach (Roots::iterator, i, rootMap) state.roots.insert(i->second);
+    for (auto & i : rootMap) state.roots.insert(i.second);
 
     /* Add additional roots returned by the program specified by the
        NIX_ROOT_FINDER environment variable.  This is typically used
@@ -636,7 +643,14 @@ void LocalStore::collectGarbage(const GCOptions & options, GCResults & results)
 
     if (state.shouldDelete) {
         if (pathExists(state.trashDir)) deleteGarbage(state, state.trashDir);
-        createDirs(state.trashDir);
+        try {
+            createDirs(state.trashDir);
+        } catch (SysError & e) {
+            if (e.errNo == ENOSPC) {
+                printMsg(lvlInfo, format("note: can't create trash directory: %1%") % e.msg());
+                state.moveToTrash = false;
+            }
+        }
     }
 
     /* Now either delete all garbage paths, or just the specified
@@ -644,11 +658,11 @@ void LocalStore::collectGarbage(const GCOptions & options, GCResults & results)
 
     if (options.action == GCOptions::gcDeleteSpecific) {
 
-        foreach (PathSet::iterator, i, options.pathsToDelete) {
-            assertStorePath(*i);
-            tryToDelete(state, *i);
-            if (state.dead.find(*i) == state.dead.end())
-                throw Error(format("cannot delete path ‘%1%’ since it is still alive") % *i);
+        for (auto & i : options.pathsToDelete) {
+            assertStorePath(i);
+            tryToDelete(state, i);
+            if (state.dead.find(i) == state.dead.end())
+                throw Error(format("cannot delete path ‘%1%’ since it is still alive") % i);
         }
 
     } else if (options.maxFreed > 0) {
@@ -692,8 +706,8 @@ void LocalStore::collectGarbage(const GCOptions & options, GCResults & results)
             vector<Path> entries_(entries.begin(), entries.end());
             random_shuffle(entries_.begin(), entries_.end());
 
-            foreach (vector<Path>::iterator, i, entries_)
-                tryToDelete(state, *i);
+            for (auto & i : entries_)
+                tryToDelete(state, i);
 
         } catch (GCLimitReached & e) {
         }

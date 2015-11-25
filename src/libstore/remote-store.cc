@@ -5,6 +5,7 @@
 #include "archive.hh"
 #include "affinity.hh"
 #include "globals.hh"
+#include "derivations.hh"
 
 #include <sys/types.h>
 #include <sys/stat.h>
@@ -32,7 +33,7 @@ Path readStorePath(Source & from)
 template<class T> T readStorePaths(Source & from)
 {
     T paths = readStrings<T>(from);
-    foreach (typename T::iterator, i, paths) assertStorePath(*i);
+    for (auto & i : paths) assertStorePath(i);
     return paths;
 }
 
@@ -64,7 +65,7 @@ void RemoteStore::openConnection(bool reserveSpace)
 
     /* Send the magic greeting, check for the reply. */
     try {
-        writeInt(WORKER_MAGIC_1, to);
+        to << WORKER_MAGIC_1;
         to.flush();
         unsigned int magic = readInt(from);
         if (magic != WORKER_MAGIC_2) throw Error("protocol mismatch");
@@ -72,19 +73,18 @@ void RemoteStore::openConnection(bool reserveSpace)
         daemonVersion = readInt(from);
         if (GET_PROTOCOL_MAJOR(daemonVersion) != GET_PROTOCOL_MAJOR(PROTOCOL_VERSION))
             throw Error("Nix daemon protocol version not supported");
-        writeInt(PROTOCOL_VERSION, to);
+        to << PROTOCOL_VERSION;
 
         if (GET_PROTOCOL_MINOR(daemonVersion) >= 14) {
             int cpu = settings.lockCPU ? lockToCurrentCPU() : -1;
-            if (cpu != -1) {
-                writeInt(1, to);
-                writeInt(cpu, to);
-            } else
-                writeInt(0, to);
+            if (cpu != -1)
+                to << 1 << cpu;
+            else
+                to << 0;
         }
 
         if (GET_PROTOCOL_MINOR(daemonVersion) >= 11)
-            writeInt(reserveSpace, to);
+            to << reserveSpace;
 
         processStderr();
     }
@@ -189,35 +189,31 @@ RemoteStore::~RemoteStore()
 
 void RemoteStore::setOptions()
 {
-    writeInt(wopSetOptions, to);
-
-    writeInt(settings.keepFailed, to);
-    writeInt(settings.keepGoing, to);
-    writeInt(settings.tryFallback, to);
-    writeInt(verbosity, to);
-    writeInt(settings.maxBuildJobs, to);
-    writeInt(settings.maxSilentTime, to);
+    to << wopSetOptions
+       << settings.keepFailed
+       << settings.keepGoing
+       << settings.tryFallback
+       << verbosity
+       << settings.maxBuildJobs
+       << settings.maxSilentTime;
     if (GET_PROTOCOL_MINOR(daemonVersion) >= 2)
-        writeInt(settings.useBuildHook, to);
-    if (GET_PROTOCOL_MINOR(daemonVersion) >= 4) {
-        writeInt(settings.buildVerbosity, to);
-        writeInt(logType, to);
-        writeInt(settings.printBuildTrace, to);
-    }
+        to << settings.useBuildHook;
+    if (GET_PROTOCOL_MINOR(daemonVersion) >= 4)
+        to << settings.buildVerbosity
+           << logType
+           << settings.printBuildTrace;
     if (GET_PROTOCOL_MINOR(daemonVersion) >= 6)
-        writeInt(settings.buildCores, to);
+        to << settings.buildCores;
     if (GET_PROTOCOL_MINOR(daemonVersion) >= 10)
-        writeInt(settings.useSubstitutes, to);
+        to << settings.useSubstitutes;
 
     if (GET_PROTOCOL_MINOR(daemonVersion) >= 12) {
         Settings::SettingsMap overrides = settings.getOverrides();
         if (overrides["ssh-auth-sock"] == "")
             overrides["ssh-auth-sock"] = getEnv("SSH_AUTH_SOCK");
-        writeInt(overrides.size(), to);
-        foreach (Settings::SettingsMap::iterator, i, overrides) {
-            writeString(i->first, to);
-            writeString(i->second, to);
-        }
+        to << overrides.size();
+        for (auto & i : overrides)
+            to << i.first << i.second;
     }
 
     processStderr();
@@ -227,8 +223,7 @@ void RemoteStore::setOptions()
 bool RemoteStore::isValidPath(const Path & path)
 {
     openConnection();
-    writeInt(wopIsValidPath, to);
-    writeString(path, to);
+    to << wopIsValidPath << path;
     processStderr();
     unsigned int reply = readInt(from);
     return reply != 0;
@@ -240,12 +235,11 @@ PathSet RemoteStore::queryValidPaths(const PathSet & paths)
     openConnection();
     if (GET_PROTOCOL_MINOR(daemonVersion) < 12) {
         PathSet res;
-        foreach (PathSet::const_iterator, i, paths)
-            if (isValidPath(*i)) res.insert(*i);
+        for (auto & i : paths)
+            if (isValidPath(i)) res.insert(i);
         return res;
     } else {
-        writeInt(wopQueryValidPaths, to);
-        writeStrings(paths, to);
+        to << wopQueryValidPaths << paths;
         processStderr();
         return readStorePaths<PathSet>(from);
     }
@@ -255,7 +249,7 @@ PathSet RemoteStore::queryValidPaths(const PathSet & paths)
 PathSet RemoteStore::queryAllValidPaths()
 {
     openConnection();
-    writeInt(wopQueryAllValidPaths, to);
+    to << wopQueryAllValidPaths;
     processStderr();
     return readStorePaths<PathSet>(from);
 }
@@ -266,16 +260,14 @@ PathSet RemoteStore::querySubstitutablePaths(const PathSet & paths)
     openConnection();
     if (GET_PROTOCOL_MINOR(daemonVersion) < 12) {
         PathSet res;
-        foreach (PathSet::const_iterator, i, paths) {
-            writeInt(wopHasSubstitutes, to);
-            writeString(*i, to);
+        for (auto & i : paths) {
+            to << wopHasSubstitutes << i;
             processStderr();
-            if (readInt(from)) res.insert(*i);
+            if (readInt(from)) res.insert(i);
         }
         return res;
     } else {
-        writeInt(wopQuerySubstitutablePaths, to);
-        writeStrings(paths, to);
+        to << wopQuerySubstitutablePaths << paths;
         processStderr();
         return readStorePaths<PathSet>(from);
     }
@@ -293,10 +285,9 @@ void RemoteStore::querySubstitutablePathInfos(const PathSet & paths,
 
     if (GET_PROTOCOL_MINOR(daemonVersion) < 12) {
 
-        foreach (PathSet::const_iterator, i, paths) {
+        for (auto & i : paths) {
             SubstitutablePathInfo info;
-            writeInt(wopQuerySubstitutablePathInfo, to);
-            writeString(*i, to);
+            to << wopQuerySubstitutablePathInfo << i;
             processStderr();
             unsigned int reply = readInt(from);
             if (reply == 0) continue;
@@ -305,13 +296,12 @@ void RemoteStore::querySubstitutablePathInfos(const PathSet & paths,
             info.references = readStorePaths<PathSet>(from);
             info.downloadSize = readLongLong(from);
             info.narSize = GET_PROTOCOL_MINOR(daemonVersion) >= 7 ? readLongLong(from) : 0;
-            infos[*i] = info;
+            infos[i] = info;
         }
 
     } else {
 
-        writeInt(wopQuerySubstitutablePathInfos, to);
-        writeStrings(paths, to);
+        to << wopQuerySubstitutablePathInfos << paths;
         processStderr();
         unsigned int count = readInt(from);
         for (unsigned int n = 0; n < count; n++) {
@@ -331,8 +321,7 @@ void RemoteStore::querySubstitutablePathInfos(const PathSet & paths,
 ValidPathInfo RemoteStore::queryPathInfo(const Path & path)
 {
     openConnection();
-    writeInt(wopQueryPathInfo, to);
-    writeString(path, to);
+    to << wopQueryPathInfo << path;
     processStderr();
     ValidPathInfo info;
     info.path = path;
@@ -349,8 +338,7 @@ ValidPathInfo RemoteStore::queryPathInfo(const Path & path)
 Hash RemoteStore::queryPathHash(const Path & path)
 {
     openConnection();
-    writeInt(wopQueryPathHash, to);
-    writeString(path, to);
+    to << wopQueryPathHash << path;
     processStderr();
     string hash = readString(from);
     return parseHash(htSHA256, hash);
@@ -361,8 +349,7 @@ void RemoteStore::queryReferences(const Path & path,
     PathSet & references)
 {
     openConnection();
-    writeInt(wopQueryReferences, to);
-    writeString(path, to);
+    to << wopQueryReferences << path;
     processStderr();
     PathSet references2 = readStorePaths<PathSet>(from);
     references.insert(references2.begin(), references2.end());
@@ -373,8 +360,7 @@ void RemoteStore::queryReferrers(const Path & path,
     PathSet & referrers)
 {
     openConnection();
-    writeInt(wopQueryReferrers, to);
-    writeString(path, to);
+    to << wopQueryReferrers << path;
     processStderr();
     PathSet referrers2 = readStorePaths<PathSet>(from);
     referrers.insert(referrers2.begin(), referrers2.end());
@@ -384,8 +370,7 @@ void RemoteStore::queryReferrers(const Path & path,
 Path RemoteStore::queryDeriver(const Path & path)
 {
     openConnection();
-    writeInt(wopQueryDeriver, to);
-    writeString(path, to);
+    to << wopQueryDeriver << path;
     processStderr();
     Path drvPath = readString(from);
     if (drvPath != "") assertStorePath(drvPath);
@@ -396,8 +381,7 @@ Path RemoteStore::queryDeriver(const Path & path)
 PathSet RemoteStore::queryValidDerivers(const Path & path)
 {
     openConnection();
-    writeInt(wopQueryValidDerivers, to);
-    writeString(path, to);
+    to << wopQueryValidDerivers << path;
     processStderr();
     return readStorePaths<PathSet>(from);
 }
@@ -406,8 +390,7 @@ PathSet RemoteStore::queryValidDerivers(const Path & path)
 PathSet RemoteStore::queryDerivationOutputs(const Path & path)
 {
     openConnection();
-    writeInt(wopQueryDerivationOutputs, to);
-    writeString(path, to);
+    to << wopQueryDerivationOutputs << path;
     processStderr();
     return readStorePaths<PathSet>(from);
 }
@@ -416,8 +399,7 @@ PathSet RemoteStore::queryDerivationOutputs(const Path & path)
 PathSet RemoteStore::queryDerivationOutputNames(const Path & path)
 {
     openConnection();
-    writeInt(wopQueryDerivationOutputNames, to);
-    writeString(path, to);
+    to << wopQueryDerivationOutputNames << path;
     processStderr();
     return readStrings<PathSet>(from);
 }
@@ -426,8 +408,7 @@ PathSet RemoteStore::queryDerivationOutputNames(const Path & path)
 Path RemoteStore::queryPathFromHashPart(const string & hashPart)
 {
     openConnection();
-    writeInt(wopQueryPathFromHashPart, to);
-    writeString(hashPart, to);
+    to << wopQueryPathFromHashPart << hashPart;
     processStderr();
     Path path = readString(from);
     if (!path.empty()) assertStorePath(path);
@@ -444,12 +425,10 @@ Path RemoteStore::addToStore(const string & name, const Path & _srcPath,
 
     Path srcPath(absPath(_srcPath));
 
-    writeInt(wopAddToStore, to);
-    writeString(name, to);
-    /* backwards compatibility hack */
-    writeInt((hashAlgo == htSHA256 && recursive) ? 0 : 1, to);
-    writeInt(recursive ? 1 : 0, to);
-    writeString(printHashType(hashAlgo), to);
+    to << wopAddToStore << name
+       << ((hashAlgo == htSHA256 && recursive) ? 0 : 1) /* backwards compatibility hack */
+       << (recursive ? 1 : 0)
+       << printHashType(hashAlgo);
 
     try {
         to.written = 0;
@@ -477,10 +456,7 @@ Path RemoteStore::addTextToStore(const string & name, const string & s,
     if (repair) throw Error("repairing is not supported when building through the Nix daemon");
 
     openConnection();
-    writeInt(wopAddTextToStore, to);
-    writeString(name, to);
-    writeString(s, to);
-    writeStrings(references, to);
+    to << wopAddTextToStore << name << s << references;
 
     processStderr();
     return readStorePath(from);
@@ -491,9 +467,7 @@ void RemoteStore::exportPath(const Path & path, bool sign,
     Sink & sink)
 {
     openConnection();
-    writeInt(wopExportPath, to);
-    writeString(path, to);
-    writeInt(sign ? 1 : 0, to);
+    to << wopExportPath << path << (sign ? 1 : 0);
     processStderr(&sink); /* sink receives the actual data */
     readInt(from);
 }
@@ -502,7 +476,7 @@ void RemoteStore::exportPath(const Path & path, bool sign,
 Paths RemoteStore::importPaths(bool requireSignature, Source & source)
 {
     openConnection();
-    writeInt(wopImportPaths, to);
+    to << wopImportPaths;
     /* We ignore requireSignature, since the worker forces it to true
        anyway. */
     processStderr(0, &source);
@@ -514,27 +488,40 @@ void RemoteStore::buildPaths(const PathSet & drvPaths, BuildMode buildMode)
 {
     if (buildMode != bmNormal) throw Error("repairing or checking is not supported when building through the Nix daemon");
     openConnection();
-    writeInt(wopBuildPaths, to);
+    to << wopBuildPaths;
     if (GET_PROTOCOL_MINOR(daemonVersion) >= 13)
-        writeStrings(drvPaths, to);
+        to << drvPaths;
     else {
         /* For backwards compatibility with old daemons, strip output
            identifiers. */
         PathSet drvPaths2;
-        foreach (PathSet::const_iterator, i, drvPaths)
-            drvPaths2.insert(string(*i, 0, i->find('!')));
-        writeStrings(drvPaths2, to);
+        for (auto & i : drvPaths)
+            drvPaths2.insert(string(i, 0, i.find('!')));
+        to << drvPaths2;
     }
     processStderr();
     readInt(from);
 }
 
 
+BuildResult RemoteStore::buildDerivation(const Path & drvPath, const BasicDerivation & drv,
+    BuildMode buildMode)
+{
+    openConnection();
+    to << wopBuildDerivation << drvPath << drv << buildMode;
+    processStderr();
+    BuildResult res;
+    unsigned int status;
+    from >> status >> res.errorMsg;
+    res.status = (BuildResult::Status) status;
+    return res;
+}
+
+
 void RemoteStore::ensurePath(const Path & path)
 {
     openConnection();
-    writeInt(wopEnsurePath, to);
-    writeString(path, to);
+    to << wopEnsurePath << path;
     processStderr();
     readInt(from);
 }
@@ -543,8 +530,7 @@ void RemoteStore::ensurePath(const Path & path)
 void RemoteStore::addTempRoot(const Path & path)
 {
     openConnection();
-    writeInt(wopAddTempRoot, to);
-    writeString(path, to);
+    to << wopAddTempRoot << path;
     processStderr();
     readInt(from);
 }
@@ -553,8 +539,7 @@ void RemoteStore::addTempRoot(const Path & path)
 void RemoteStore::addIndirectRoot(const Path & path)
 {
     openConnection();
-    writeInt(wopAddIndirectRoot, to);
-    writeString(path, to);
+    to << wopAddIndirectRoot << path;
     processStderr();
     readInt(from);
 }
@@ -563,7 +548,7 @@ void RemoteStore::addIndirectRoot(const Path & path)
 void RemoteStore::syncWithGC()
 {
     openConnection();
-    writeInt(wopSyncWithGC, to);
+    to << wopSyncWithGC;
     processStderr();
     readInt(from);
 }
@@ -572,7 +557,7 @@ void RemoteStore::syncWithGC()
 Roots RemoteStore::findRoots()
 {
     openConnection();
-    writeInt(wopFindRoots, to);
+    to << wopFindRoots;
     processStderr();
     unsigned int count = readInt(from);
     Roots result;
@@ -589,17 +574,11 @@ void RemoteStore::collectGarbage(const GCOptions & options, GCResults & results)
 {
     openConnection(false);
 
-    writeInt(wopCollectGarbage, to);
-    writeInt(options.action, to);
-    writeStrings(options.pathsToDelete, to);
-    writeInt(options.ignoreLiveness, to);
-    writeLongLong(options.maxFreed, to);
-    writeInt(0, to);
-    if (GET_PROTOCOL_MINOR(daemonVersion) >= 5) {
+    to << wopCollectGarbage << options.action << options.pathsToDelete << options.ignoreLiveness
+       << options.maxFreed << 0;
+    if (GET_PROTOCOL_MINOR(daemonVersion) >= 5)
         /* removed options */
-        writeInt(0, to);
-        writeInt(0, to);
-    }
+        to << 0 << 0;
 
     processStderr();
 
@@ -612,7 +591,7 @@ void RemoteStore::collectGarbage(const GCOptions & options, GCResults & results)
 PathSet RemoteStore::queryFailedPaths()
 {
     openConnection();
-    writeInt(wopQueryFailedPaths, to);
+    to << wopQueryFailedPaths;
     processStderr();
     return readStorePaths<PathSet>(from);
 }
@@ -621,8 +600,7 @@ PathSet RemoteStore::queryFailedPaths()
 void RemoteStore::clearFailedPaths(const PathSet & paths)
 {
     openConnection();
-    writeInt(wopClearFailedPaths, to);
-    writeStrings(paths, to);
+    to << wopClearFailedPaths << paths;
     processStderr();
     readInt(from);
 }
@@ -630,9 +608,17 @@ void RemoteStore::clearFailedPaths(const PathSet & paths)
 void RemoteStore::optimiseStore()
 {
     openConnection();
-    writeInt(wopOptimiseStore, to);
+    to << wopOptimiseStore;
     processStderr();
     readInt(from);
+}
+
+bool RemoteStore::verifyStore(bool checkContents, bool repair)
+{
+    openConnection();
+    to << wopVerifyStore << checkContents << repair;
+    processStderr();
+    return readInt(from) != 0;
 }
 
 void RemoteStore::processStderr(Sink * sink, Source * source)

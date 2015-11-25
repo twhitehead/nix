@@ -212,6 +212,7 @@ Path downloadFileCached(const string & url, bool unpack)
             printMsg(lvlInfo, format("unpacking ‘%1%’...") % url);
             Path tmpDir = createTempDir();
             AutoDelete autoDelete(tmpDir, true);
+            // FIXME: this requires GNU tar for decompression.
             runProgram("tar", true, {"xf", storePath, "-C", tmpDir, "--strip-components", "1"}, "");
             unpackedStorePath = store->addToStore(name, tmpDir, true, htSHA256, defaultPathFilter, false);
         }
@@ -228,7 +229,7 @@ bool isUri(const string & s)
     size_t pos = s.find("://");
     if (pos == string::npos) return false;
     string scheme(s, 0, pos);
-    return scheme == "http" || scheme == "https";
+    return scheme == "http" || scheme == "https" || scheme == "file";
 }
 
 

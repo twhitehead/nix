@@ -16,11 +16,11 @@ BufferedSink::~BufferedSink()
     delete[] buffer;
 }
 
-    
+
 void BufferedSink::operator () (const unsigned char * data, size_t len)
 {
     if (!buffer) buffer = new unsigned char[bufSize];
-    
+
     while (len) {
         /* Optimisation: bypass the buffer if the data exceeds the
            buffer size. */
@@ -96,7 +96,7 @@ size_t BufferedSource::read(unsigned char * data, size_t len)
     if (!buffer) buffer = new unsigned char[bufSize];
 
     if (!bufPosIn) bufPosIn = readUnbuffered(buffer, bufSize);
-            
+
     /* Copy out the data in the buffer. */
     size_t n = len > bufPosIn - bufPosOut ? bufPosIn - bufPosOut : len;
     memcpy(data, buffer + bufPosOut, n);
@@ -144,56 +144,39 @@ void writePadding(size_t len, Sink & sink)
 }
 
 
-void writeInt(unsigned int n, Sink & sink)
-{
-    unsigned char buf[8];
-    memset(buf, 0, sizeof(buf));
-    buf[0] = n & 0xff;
-    buf[1] = (n >> 8) & 0xff;
-    buf[2] = (n >> 16) & 0xff;
-    buf[3] = (n >> 24) & 0xff;
-    sink(buf, sizeof(buf));
-}
-
-
-void writeLongLong(unsigned long long n, Sink & sink)
-{
-    unsigned char buf[8];
-    buf[0] = n & 0xff;
-    buf[1] = (n >> 8) & 0xff;
-    buf[2] = (n >> 16) & 0xff;
-    buf[3] = (n >> 24) & 0xff;
-    buf[4] = (n >> 32) & 0xff;
-    buf[5] = (n >> 40) & 0xff;
-    buf[6] = (n >> 48) & 0xff;
-    buf[7] = (n >> 56) & 0xff;
-    sink(buf, sizeof(buf));
-}
-
-
 void writeString(const unsigned char * buf, size_t len, Sink & sink)
 {
-    writeInt(len, sink);
+    sink << len;
     sink(buf, len);
     writePadding(len, sink);
 }
 
 
-void writeString(const string & s, Sink & sink)
+Sink & operator << (Sink & sink, const string & s)
 {
     writeString((const unsigned char *) s.data(), s.size(), sink);
+    return sink;
 }
 
 
 template<class T> void writeStrings(const T & ss, Sink & sink)
 {
-    writeInt(ss.size(), sink);
-    foreach (typename T::const_iterator, i, ss)
-        writeString(*i, sink);
+    sink << ss.size();
+    for (auto & i : ss)
+        sink << i;
 }
 
-template void writeStrings(const Paths & ss, Sink & sink);
-template void writeStrings(const PathSet & ss, Sink & sink);
+Sink & operator << (Sink & sink, const Strings & s)
+{
+    writeStrings(s, sink);
+    return sink;
+}
+
+Sink & operator << (Sink & sink, const StringSet & s)
+{
+    writeStrings(s, sink);
+    return sink;
+}
 
 
 void readPadding(size_t len, Source & source)
@@ -247,7 +230,7 @@ size_t readString(unsigned char * buf, size_t max, Source & source)
     return len;
 }
 
- 
+
 string readString(Source & source)
 {
     size_t len = readInt(source);
@@ -258,7 +241,20 @@ string readString(Source & source)
     return string((char *) buf, len);
 }
 
- 
+Source & operator >> (Source & in, string & s)
+{
+    s = readString(in);
+    return in;
+}
+
+
+Source & operator >> (Source & in, unsigned int & n)
+{
+    n = readInt(in);
+    return in;
+}
+
+
 template<class T> T readStrings(Source & source)
 {
     unsigned int count = readInt(source);

@@ -1,6 +1,9 @@
 %option reentrant bison-bridge bison-locations
 %option noyywrap
 %option never-interactive
+%option stack
+%option nodefault
+%option nounput noyy_top_state
 
 
 %x STRING
@@ -74,6 +77,9 @@ static Expr * unescapeStr(SymbolTable & symbols, const char * s)
 #define YY_USER_INIT initLoc(yylloc)
 #define YY_USER_ACTION adjustLoc(yylloc, yytext, yyleng);
 
+#define PUSH_STATE(state) yy_push_state(state, yyscanner)
+#define POP_STATE() yy_pop_state(yyscanner)
+
 %}
 
 
@@ -118,23 +124,24 @@ or          { return OR_KW; }
               return INT;
             }
 
-\$\{        { return DOLLAR_CURLY; }
+\$\{        { PUSH_STATE(INITIAL); return DOLLAR_CURLY; }
+\{          { PUSH_STATE(INITIAL); return '{'; }
+\}          { POP_STATE(); return '}'; }
 
-\"          { BEGIN(STRING); return '"'; }
-<STRING>([^\$\"\\]|\$[^\{\"]|\\.)+ {
-              /* !!! Not quite right: we want a follow restriction on
-                 "$", it shouldn't be followed by a "{".  Right now
-                 "$\"" will be consumed as part of a string, rather
-                 than a "$" followed by the string terminator.
-                 Disallow "$\"" for now. */
+\"          { PUSH_STATE(STRING); return '"'; }
+<STRING>([^\$\"\\]|\$[^\{\"\\]|\\.|\$\\.)*\$/\" |
+<STRING>([^\$\"\\]|\$[^\{\"\\]|\\.|\$\\.)+ {
+              /* It is impossible to match strings ending with '$' with one
+                 regex because trailing contexts are only valid at the end
+                 of a rule. (A sane but undocumented limitation.) */
               yylval->e = unescapeStr(data->symbols, yytext);
               return STR;
             }
-<STRING>\$\{  { BEGIN(INITIAL); return DOLLAR_CURLY; }
-<STRING>\"  { BEGIN(INITIAL); return '"'; }
+<STRING>\$\{  { PUSH_STATE(INITIAL); return DOLLAR_CURLY; }
+<STRING>\"  { POP_STATE(); return '"'; }
 <STRING>.   return yytext[0]; /* just in case: shouldn't be reached */
 
-\'\'(\ *\n)?     { BEGIN(IND_STRING); return IND_STRING_OPEN; }
+\'\'(\ *\n)?     { PUSH_STATE(IND_STRING); return IND_STRING_OPEN; }
 <IND_STRING>([^\$\']|\$[^\{\']|\'[^\'\$])+ {
                    yylval->e = new ExprIndStr(yytext);
                    return IND_STR;
@@ -151,8 +158,8 @@ or          { return OR_KW; }
                    yylval->e = unescapeStr(data->symbols, yytext + 2);
                    return IND_STR;
                  }
-<IND_STRING>\$\{ { BEGIN(INITIAL); return DOLLAR_CURLY; }
-<IND_STRING>\'\' { BEGIN(INITIAL); return IND_STRING_CLOSE; }
+<IND_STRING>\$\{ { PUSH_STATE(INITIAL); return DOLLAR_CURLY; }
+<IND_STRING>\'\' { POP_STATE(); return IND_STRING_CLOSE; }
 <IND_STRING>\'   {
                    yylval->e = new ExprIndStr("'");
                    return IND_STR;
@@ -173,23 +180,3 @@ or          { return OR_KW; }
 
 %%
 
-
-namespace nix {
-
-/* Horrible, disgusting hack: allow the parser to set the scanner
-   start condition back to STRING.  Necessary in interpolations like
-   "foo${expr}bar"; after the close brace we have to go back to the
-   STRING state. */
-void backToString(yyscan_t scanner)
-{
-    struct yyguts_t * yyg = (struct yyguts_t *) scanner;
-    BEGIN(STRING);
-}
-
-void backToIndString(yyscan_t scanner)
-{
-    struct yyguts_t * yyg = (struct yyguts_t *) scanner;
-    BEGIN(IND_STRING);
-}
-
-}

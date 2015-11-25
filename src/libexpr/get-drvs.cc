@@ -39,9 +39,9 @@ DrvInfo::Outputs DrvInfo::queryOutputs()
             state->forceList(*i->value, *i->pos);
 
             /* For each output... */
-            for (unsigned int j = 0; j < i->value->list.length; ++j) {
+            for (unsigned int j = 0; j < i->value->listSize(); ++j) {
                 /* Evaluate the corresponding set. */
-                string name = state->forceStringNoCtx(*i->value->list.elems[j], *i->pos);
+                string name = state->forceStringNoCtx(*i->value->listElems()[j], *i->pos);
                 Bindings::iterator out = attrs->find(state->symbols.create(name));
                 if (out == attrs->end()) continue; // FIXME: throw error?
                 state->forceAttrs(*out->value);
@@ -85,8 +85,8 @@ StringSet DrvInfo::queryMetaNames()
 {
     StringSet res;
     if (!getMeta()) return res;
-    foreach (Bindings::iterator, i, *meta)
-        res.insert(i->name);
+    for (auto & i : *meta)
+        res.insert(i.name);
     return res;
 }
 
@@ -94,16 +94,16 @@ StringSet DrvInfo::queryMetaNames()
 bool DrvInfo::checkMeta(Value & v)
 {
     state->forceValue(v);
-    if (v.type == tList) {
-        for (unsigned int n = 0; n < v.list.length; ++n)
-            if (!checkMeta(*v.list.elems[n])) return false;
+    if (v.isList()) {
+        for (unsigned int n = 0; n < v.listSize(); ++n)
+            if (!checkMeta(*v.listElems()[n])) return false;
         return true;
     }
     else if (v.type == tAttrs) {
         Bindings::iterator i = v.attrs->find(state->sOutPath);
         if (i != v.attrs->end()) return false;
-        foreach (Bindings::iterator, i, *v.attrs)
-            if (!checkMeta(*i->value)) return false;
+        for (auto & i : *v.attrs)
+            if (!checkMeta(*i.value)) return false;
         return true;
     }
     else return v.type == tInt || v.type == tBool || v.type == tString;
@@ -255,13 +255,13 @@ static void getDerivations(EvalState & state, Value & vIn,
            precedence). */
         typedef std::map<string, Symbol> SortedSymbols;
         SortedSymbols attrs;
-        foreach (Bindings::iterator, i, *v.attrs)
-            attrs.insert(std::pair<string, Symbol>(i->name, i->name));
+        for (auto & i : *v.attrs)
+            attrs.insert(std::pair<string, Symbol>(i.name, i.name));
 
-        foreach (SortedSymbols::iterator, i, attrs) {
-            startNest(nest, lvlDebug, format("evaluating attribute ‘%1%’") % i->first);
-            string pathPrefix2 = addToPath(pathPrefix, i->first);
-            Value & v2(*v.attrs->find(i->second)->value);
+        for (auto & i : attrs) {
+            startNest(nest, lvlDebug, format("evaluating attribute ‘%1%’") % i.first);
+            string pathPrefix2 = addToPath(pathPrefix, i.first);
+            Value & v2(*v.attrs->find(i.second)->value);
             if (combineChannels)
                 getDerivations(state, v2, pathPrefix2, autoArgs, drvs, done, ignoreAssertionFailures);
             else if (getDerivation(state, v2, pathPrefix2, drvs, done, ignoreAssertionFailures)) {
@@ -277,13 +277,13 @@ static void getDerivations(EvalState & state, Value & vIn,
         }
     }
 
-    else if (v.type == tList) {
-        for (unsigned int n = 0; n < v.list.length; ++n) {
+    else if (v.isList()) {
+        for (unsigned int n = 0; n < v.listSize(); ++n) {
             startNest(nest, lvlDebug,
                 format("evaluating list element"));
             string pathPrefix2 = addToPath(pathPrefix, (format("%1%") % n).str());
-            if (getDerivation(state, *v.list.elems[n], pathPrefix2, drvs, done, ignoreAssertionFailures))
-                getDerivations(state, *v.list.elems[n], pathPrefix2, autoArgs, drvs, done, ignoreAssertionFailures);
+            if (getDerivation(state, *v.listElems()[n], pathPrefix2, drvs, done, ignoreAssertionFailures))
+                getDerivations(state, *v.listElems()[n], pathPrefix2, autoArgs, drvs, done, ignoreAssertionFailures);
         }
     }
 

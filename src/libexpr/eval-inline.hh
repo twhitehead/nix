@@ -7,9 +7,9 @@
 
 namespace nix {
 
-LocalNoInlineNoReturn(void throwEvalError(const char * s))
+LocalNoInlineNoReturn(void throwEvalError(const char * s, const Pos & pos))
 {
-    throw EvalError(s);
+    throw EvalError(format(s) % pos);
 }
 
 LocalNoInlineNoReturn(void throwTypeError(const char * s, const Value & v))
@@ -24,7 +24,7 @@ LocalNoInlineNoReturn(void throwTypeError(const char * s, const Value & v, const
 }
 
 
-void EvalState::forceValue(Value & v)
+void EvalState::forceValue(Value & v, const Pos & pos)
 {
     if (v.type == tThunk) {
         Env * env = v.thunk.env;
@@ -43,7 +43,7 @@ void EvalState::forceValue(Value & v)
     else if (v.type == tApp)
         callFunction(*v.app.left, *v.app.right, v, noPos);
     else if (v.type == tBlackhole)
-        throwEvalError("infinite recursion encountered");
+        throwEvalError("infinite recursion encountered, at %1%", pos);
 }
 
 
@@ -66,7 +66,7 @@ inline void EvalState::forceAttrs(Value & v, const Pos & pos)
 inline void EvalState::forceList(Value & v)
 {
     forceValue(v);
-    if (v.type != tList)
+    if (!v.isList())
         throwTypeError("value is %1% while a list was expected", v);
 }
 
@@ -74,7 +74,7 @@ inline void EvalState::forceList(Value & v)
 inline void EvalState::forceList(Value & v, const Pos & pos)
 {
     forceValue(v);
-    if (v.type != tList)
+    if (!v.isList())
         throwTypeError("value is %1% while a list was expected, at %2%", v, pos);
 }
 

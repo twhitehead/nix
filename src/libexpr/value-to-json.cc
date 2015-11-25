@@ -12,14 +12,14 @@ namespace nix {
 void escapeJSON(std::ostream & str, const string & s)
 {
     str << "\"";
-    foreach (string::const_iterator, i, s)
-        if (*i == '\"' || *i == '\\') str << "\\" << *i;
-        else if (*i == '\n') str << "\\n";
-        else if (*i == '\r') str << "\\r";
-        else if (*i == '\t') str << "\\t";
-        else if (*i >= 0 && *i < 32)
-            str << "\\u" << std::setfill('0') << std::setw(4) << std::hex << (uint16_t) *i << std::dec;
-        else str << *i;
+    for (auto & i : s)
+        if (i == '\"' || i == '\\') str << "\\" << i;
+        else if (i == '\n') str << "\\n";
+        else if (i == '\r') str << "\\r";
+        else if (i == '\t') str << "\\t";
+        else if (i >= 0 && i < 32)
+            str << "\\u" << std::setfill('0') << std::setw(4) << std::hex << (uint16_t) i << std::dec;
+        else str << i;
     str << "\"";
 }
 
@@ -59,11 +59,11 @@ void printValueAsJSON(EvalState & state, bool strict,
             if (i == v.attrs->end()) {
                 JSONObject json(str);
                 StringSet names;
-                foreach (Bindings::iterator, i, *v.attrs)
-                    names.insert(i->name);
-                foreach (StringSet::iterator, i, names) {
-                    Attr & a(*v.attrs->find(state.symbols.create(*i)));
-                    json.attr(*i);
+                for (auto & j : *v.attrs)
+                    names.insert(j.name);
+                for (auto & j : names) {
+                    Attr & a(*v.attrs->find(state.symbols.create(j)));
+                    json.attr(j);
                     printValueAsJSON(state, strict, *a.value, str, context);
                 }
             } else
@@ -71,16 +71,16 @@ void printValueAsJSON(EvalState & state, bool strict,
             break;
         }
 
-        case tList: {
+        case tList1: case tList2: case tListN: {
             JSONList json(str);
-            for (unsigned int n = 0; n < v.list.length; ++n) {
+            for (unsigned int n = 0; n < v.listSize(); ++n) {
                 json.elem();
-                printValueAsJSON(state, strict, *v.list.elems[n], str, context);
+                printValueAsJSON(state, strict, *v.listElems()[n], str, context);
             }
             break;
         }
 
-	case tExternal:
+        case tExternal:
             v.external->printValueAsJSON(state, strict, str, context);
             break;
 

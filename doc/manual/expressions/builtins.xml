@@ -39,6 +39,28 @@ available as <function>builtins.derivation</function>.</para>
   </varlistentry>
 
 
+  <varlistentry><term><function>builtins.all</function>
+  <replaceable>pred</replaceable> <replaceable>list</replaceable></term>
+
+    <listitem><para>Return <literal>true</literal> if the function
+    <replaceable>pred</replaceable> returns <literal>true</literal>
+    for all elements of <replaceable>list</replaceable>,
+    and <literal>false</literal> otherwise.</para></listitem>
+
+  </varlistentry>
+
+
+  <varlistentry><term><function>builtins.any</function>
+  <replaceable>pred</replaceable> <replaceable>list</replaceable></term>
+
+    <listitem><para>Return <literal>true</literal> if the function
+    <replaceable>pred</replaceable> returns <literal>true</literal>
+    for at least one element of <replaceable>list</replaceable>,
+    and <literal>false</literal> otherwise.</para></listitem>
+
+  </varlistentry>
+
+
   <varlistentry><term><function>builtins.attrNames</function>
   <replaceable>set</replaceable></term>
 
@@ -211,6 +233,45 @@ if builtins ? getEnv then builtins.getEnv "PATH" else ""</programlisting>
   </varlistentry>
 
 
+  <varlistentry><term><function>builtins.fetchurl</function>
+  <replaceable>url</replaceable></term>
+
+    <listitem><para>Download the specified URL and return the path of
+    the downloaded file. This function is not available if <link
+    linkend="conf-restrict-eval">restricted evaluation mode</link> is
+    enabled.</para></listitem>
+
+  </varlistentry>
+
+
+  <varlistentry><term><function>fetchTarball</function>
+  <replaceable>url</replaceable></term>
+
+    <listitem><para>Download the specified URL, unpack it and return
+    the path of the unpacked tree. The file must be a tape archive
+    (<filename>.tar</filename>) compressed with
+    <literal>gzip</literal>, <literal>bzip2</literal> or
+    <literal>xz</literal>. The top-level path component of the files
+    in the tarball is removed, so it is best if the tarball contains a
+    single directory at top level. The typical use of the function is
+    to obtain external Nix expression dependencies, such as a
+    particular version of Nixpkgs, e.g.
+
+<programlisting>
+with import (fetchTarball https://github.com/NixOS/nixpkgs-channels/archive/nixos-14.12.tar.gz) {};
+
+stdenv.mkDerivation { … }
+</programlisting>
+
+    </para>
+
+    <para>This function is not available if <link
+    linkend="conf-restrict-eval">restricted evaluation mode</link> is
+    enabled.</para></listitem>
+
+  </varlistentry>
+
+
   <varlistentry><term><function>builtins.filter</function>
   <replaceable>f</replaceable> <replaceable>xs</replaceable></term>
 
@@ -274,6 +335,19 @@ stdenv.mkDerivation {
   </varlistentry>
 
 
+  <varlistentry><term><function>builtins.foldl’</function> 
+    <replaceable>op</replaceable> <replaceable>nul</replaceable> <replaceable>list</replaceable></term>
+
+    <listitem><para>Reduce a list by applying a binary operator, from
+    left to right, e.g. <literal>foldl’ op nul [x0 x1 x2 ...] = op (op
+    (op nul x0) x1) x2) ...</literal>. The operator is applied
+    strictly, i.e., its arguments are evaluated first. For example,
+    <literal>foldl’ (x: y: x + y) 0 [1 2 3]</literal> evaluates to
+    6.</para></listitem>
+
+  </varlistentry>
+
+
   <varlistentry><term><function>builtins.fromJSON</function> <replaceable>e</replaceable></term>
 
     <listitem><para>Convert a JSON string to a Nix
@@ -286,6 +360,24 @@ builtins.fromJSON ''{"x": [1, 2, 3], "y": null}''
     returns the value <literal>{ x = [ 1 2 3 ]; y = null;
     }</literal>. Floating point numbers are not
     supported.</para></listitem>
+
+  </varlistentry>
+
+
+  <varlistentry><term><function>builtins.genList</function>
+  <replaceable>generator</replaceable> <replaceable>length</replaceable></term>
+
+    <listitem><para>Generate list of size
+    <replaceable>length</replaceable>, with each element
+    <replaceable>i></replaceable> equal to the value returned by
+    <replaceable>generator</replaceable> <literal>i</literal>. For
+    example,
+
+<programlisting>
+builtins.genList (x: x * x) 5
+</programlisting>
+
+    returns the list <literal>[ 0 1 4 9 16 ]</literal>.</para></listitem>
 
   </varlistentry>
 
@@ -624,7 +716,7 @@ in config.someSetting</programlisting>
     ./A</literal> will return the set
 
 <programlisting>
-{ A = "regular"; B = "directory"; }</programlisting>
+{ B = "regular"; C = "directory"; }</programlisting>
 
     The possible values for the file type are
     <literal>"regular"</literal>, <literal>"directory"</literal>,
@@ -659,6 +751,23 @@ removeAttrs { x = 1; y = 2; z = 3; } [ "a" "x" "z" ]</programlisting>
   </varlistentry>
 
 
+  <varlistentry><term><function>builtins.replaceStrings</function>
+  <replaceable>from</replaceable> <replaceable>to</replaceable> <replaceable>s</replaceable></term>
+
+    <listitem><para>Given string <replaceable>s</replaceable>, replace
+    every occurrence of the strings in <replaceable>from</replaceable>
+    with the corresponding string in
+    <replaceable>to</replaceable>. For example,
+
+<programlisting>
+builtins.replaceStrings ["oo" "a"] ["a" "i"] "foobar"
+</programlisting>
+
+    evaluates to <literal>"fabir"</literal>.</para></listitem>
+
+  </varlistentry>
+
+
   <varlistentry><term><function>builtins.seq</function>
   <replaceable>e1</replaceable> <replaceable>e2</replaceable></term>
 
@@ -666,6 +775,29 @@ removeAttrs { x = 1; y = 2; z = 3; } [ "a" "x" "z" ]</programlisting>
     evaluate and return <replaceable>e2</replaceable>. This ensures
     that a computation is strict in the value of
     <replaceable>e1</replaceable>.</para></listitem>
+
+  </varlistentry>
+
+
+  <varlistentry><term><function>builtins.sort</function>
+  <replaceable>comparator</replaceable> <replaceable>list</replaceable></term>
+
+    <listitem><para>Return <replaceable>list</replaceable> in sorted
+    order. It repeatedly calls the function
+    <replaceable>comparator</replaceable> with two elements. The
+    comparator should return <literal>true</literal> if the first
+    element is less than the second, and <literal>false</literal>
+    otherwise. For example,
+
+<programlisting>
+builtins.sort builtins.lessThan [ 483 249 526 147 42 77 ]
+</programlisting>
+
+    produces the list <literal>[ 42 77 147 249 483 526
+    ]</literal>.</para>
+
+    <para>This is a stable sort: it preserves the relative order of
+    elements deemed equal by the comparator.</para></listitem>
 
   </varlistentry>
 

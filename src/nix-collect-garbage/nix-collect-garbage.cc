@@ -1,4 +1,5 @@
-#include "hash.hh"
+#include "store-api.hh"
+#include "profiles.hh"
 #include "shared.hh"
 #include "globals.hh"
 
@@ -6,26 +7,8 @@
 
 using namespace nix;
 
-std::string gen = "old";
+std::string deleteOlderThan;
 bool dryRun = false;
-
-void runProgramSimple(Path program, const Strings & args)
-{
-    checkInterrupt();
-
-    /* Fork. */
-    Pid pid = startProcess([&]() {
-        Strings args_(args);
-        args_.push_front(program);
-        auto cargs = stringsToCharPtrs(args_);
-
-        execv(program.c_str(), (char * *) &cargs[0]);
-
-        throw SysError(format("executing ‘%1%’") % program);
-    });
-
-    pid.wait(true);
-}
 
 
 /* If `-d' was specified, remove all old generations of all profiles.
@@ -34,22 +17,29 @@ void runProgramSimple(Path program, const Strings & args)
 
 void removeOldGenerations(std::string dir)
 {
+    if (access(dir.c_str(), R_OK) != 0) return;
+
+    bool canWrite = access(dir.c_str(), W_OK) == 0;
+
     for (auto & i : readDirectory(dir)) {
         checkInterrupt();
 
-        auto path = dir + "/" + i.name; 
-        auto type = getFileType(path);
+        auto path = dir + "/" + i.name;
+        auto type = i.type == DT_UNKNOWN ? getFileType(path) : i.type;
 
-        if (type == DT_LNK) {
-            auto link = readLink(path);
+        if (type == DT_LNK && canWrite) {
+            std::string link;
+            try {
+                link = readLink(path);
+            } catch (SysError & e) {
+                if (e.errNo == ENOENT) continue;
+            }
             if (link.find("link") != string::npos) {
                 printMsg(lvlInfo, format("removing old generations of profile %1%") % path);
-
-                auto args = Strings{"-p", path, "--delete-generations", gen};
-                if (dryRun) {
-                    args.push_back("--dry-run");
-                }
-                runProgramSimple(settings.nixBinDir + "/nix-env", args);
+                if (deleteOlderThan != "")
+                    deleteGenerationsOlderThan(path, deleteOlderThan, dryRun);
+                else
+                    deleteOldGenerations(path, dryRun);
             }
         } else if (type == DT_DIR) {
             removeOldGenerations(path);
@@ -60,10 +50,11 @@ void removeOldGenerations(std::string dir)
 int main(int argc, char * * argv)
 {
     bool removeOld = false;
-    Strings extraArgs;
 
     return handleExceptions(argv[0], [&]() {
         initNix();
+
+        GCOptions options;
 
         parseCmdLine(argc, argv, [&](Strings::iterator & arg, const Strings::iterator & end) {
             if (*arg == "--help")
@@ -73,11 +64,15 @@ int main(int argc, char * * argv)
             else if (*arg == "--delete-old" || *arg == "-d") removeOld = true;
             else if (*arg == "--delete-older-than") {
                 removeOld = true;
-                gen = getArg(*arg, arg, end);
+                deleteOlderThan = getArg(*arg, arg, end);
             }
             else if (*arg == "--dry-run") dryRun = true;
+            else if (*arg == "--max-freed") {
+                long long maxFreed = getIntArg<long long>(*arg, arg, end, true);
+                options.maxFreed = maxFreed >= 0 ? maxFreed : 0;
+            }
             else
-                extraArgs.push_back(*arg);
+                return false;
             return true;
         });
 
@@ -85,7 +80,12 @@ int main(int argc, char * * argv)
         if (removeOld) removeOldGenerations(profilesDir);
 
         // Run the actual garbage collector.
-        if (!dryRun) runProgramSimple(settings.nixBinDir + "/nix-store", Strings{"--gc"});
+        if (!dryRun) {
+            store = openStore(false);
+            options.action = GCOptions::gcDeleteDead;
+            GCResults results;
+            PrintFreed freed(true, results);
+            store->collectGarbage(options, results);
+        }
     });
 }
-

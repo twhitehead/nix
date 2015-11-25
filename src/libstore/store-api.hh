@@ -4,6 +4,7 @@
 #include "serialise.hh"
 
 #include <string>
+#include <limits>
 #include <map>
 #include <memory>
 
@@ -36,21 +37,19 @@ struct GCOptions
         gcDeleteSpecific,
     } GCAction;
 
-    GCAction action;
+    GCAction action{gcDeleteDead};
 
     /* If `ignoreLiveness' is set, then reachability from the roots is
        ignored (dangerous!).  However, the paths must still be
        unreferenced *within* the store (i.e., there can be no other
        store paths that depend on them). */
-    bool ignoreLiveness;
+    bool ignoreLiveness{false};
 
     /* For `gcDeleteSpecific', the paths to delete. */
     PathSet pathsToDelete;
 
     /* Stop after at least `maxFreed' bytes have been freed. */
-    unsigned long long maxFreed;
-
-    GCOptions();
+    unsigned long long maxFreed{std::numeric_limits<unsigned long long>::max()};
 };
 
 
@@ -98,6 +97,32 @@ typedef list<ValidPathInfo> ValidPathInfos;
 
 
 enum BuildMode { bmNormal, bmRepair, bmCheck };
+
+
+struct BuildResult
+{
+    enum Status {
+        Built = 0,
+        Substituted,
+        AlreadyValid,
+        PermanentFailure,
+        InputRejected,
+        OutputRejected,
+        TransientFailure, // possibly transient
+        CachedFailure,
+        TimedOut,
+        MiscFailure,
+        DependencyFailed
+    } status = MiscFailure;
+    std::string errorMsg;
+    //time_t startTime = 0, stopTime = 0;
+    bool success() {
+        return status == Built || status == Substituted || status == AlreadyValid;
+    }
+};
+
+
+struct BasicDerivation;
 
 
 class StoreAPI
@@ -194,6 +219,12 @@ public:
        not derivations, substitute them. */
     virtual void buildPaths(const PathSet & paths, BuildMode buildMode = bmNormal) = 0;
 
+    /* Build a single non-materialized derivation (i.e. not from an
+       on-disk .drv file). Note that ‘drvPath’ is only used for
+       informational purposes. */
+    virtual BuildResult buildDerivation(const Path & drvPath, const BasicDerivation & drv,
+        BuildMode buildMode = bmNormal) = 0;
+
     /* Ensure that a path is valid.  If it is not currently valid, it
        may be made valid by running a substitute (if defined for the
        path). */
@@ -254,6 +285,10 @@ public:
     /* Optimise the disk space usage of the Nix store by hard-linking files
        with the same contents. */
     virtual void optimiseStore() = 0;
+
+    /* Check the integrity of the Nix store.  Returns true if errors
+       remain. */
+    virtual bool verifyStore(bool checkContents, bool repair) = 0;
 };
 
 

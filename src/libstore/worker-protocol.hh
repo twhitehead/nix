@@ -42,7 +42,9 @@ typedef enum {
     wopQueryValidPaths = 31,
     wopQuerySubstitutablePaths = 32,
     wopQueryValidDerivers = 33,
-    wopOptimiseStore = 34
+    wopOptimiseStore = 34,
+    wopVerifyStore = 35,
+    wopBuildDerivation = 36,
 } WorkerOp;
 
 
