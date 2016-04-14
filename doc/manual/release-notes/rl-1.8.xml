@@ -4,7 +4,7 @@
       version="5.0"
       xml:id="ssec-relnotes-1.8">
 
-<title>Release 1.8 (December 14, 2014)</title>
+<title>Release 1.8 (2014-12-14)</title>
 
 <itemizedlist>
 
@@ -60,7 +60,7 @@ $ nix-store -l $(which xterm)
   <listitem><para><command>nix-copy-closure</command> now uses
   <command>nix-store --serve</command> on the remote side to send or
   receive closures. This fixes a race condition between
-  <command>nix-copy-closureE</command> and the garbage
+  <command>nix-copy-closure</command> and the garbage
   collector.</para></listitem>
 
   <listitem><para>Derivations can specify the new special attribute

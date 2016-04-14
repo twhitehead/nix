@@ -81,7 +81,7 @@ static PathSet realisePath(Path path, bool build = true)
                 printGCWarning();
             else {
                 Path rootName = gcRoot;
-                if (rootNr > 1) rootName += "-" + int2String(rootNr);
+                if (rootNr > 1) rootName += "-" + std::to_string(rootNr);
                 if (i->first != "out") rootName += "-" + i->first;
                 outPath = addPermRoot(*store, outPath, rootName, indirectRoot);
             }
@@ -98,7 +98,7 @@ static PathSet realisePath(Path path, bool build = true)
         else {
             Path rootName = gcRoot;
             rootNr++;
-            if (rootNr > 1) rootName += "-" + int2String(rootNr);
+            if (rootNr > 1) rootName += "-" + std::to_string(rootNr);
             path = addPermRoot(*store, path, rootName, indirectRoot);
         }
         return singleton<PathSet>(path);
@@ -853,7 +853,7 @@ static void opServe(Strings opFlags, Strings opArgs)
     if (magic != SERVE_MAGIC_1) throw Error("protocol mismatch");
     out << SERVE_MAGIC_2 << SERVE_PROTOCOL_VERSION;
     out.flush();
-    readInt(in); // Client version, unused for now
+    unsigned int clientVersion = readInt(in);
 
     auto getBuildSettings = [&]() {
         // FIXME: changing options here doesn't work if we're
@@ -863,6 +863,8 @@ static void opServe(Strings opFlags, Strings opArgs)
         settings.useSubstitutes = false;
         settings.maxSilentTime = readInt(in);
         settings.buildTimeout = readInt(in);
+        if (GET_PROTOCOL_MINOR(clientVersion) >= 2)
+            settings.maxLogSize = readInt(in);
     };
 
     while (true) {
@@ -1011,7 +1013,8 @@ static void opGenerateBinaryCacheKey(Strings opFlags, Strings opArgs)
     string publicKeyFile = *i++;
 
 #if HAVE_SODIUM
-    sodium_init();
+    if (sodium_init() == -1)
+        throw Error("could not initialise libsodium");
 
     unsigned char pk[crypto_sign_PUBLICKEYBYTES];
     unsigned char sk[crypto_sign_SECRETKEYBYTES];

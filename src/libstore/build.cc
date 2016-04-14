@@ -34,46 +34,27 @@
 
 #include <bzlib.h>
 
-/* Includes required for chroot support. */
-#if HAVE_SYS_PARAM_H
-#include <sys/param.h>
-#endif
-#if HAVE_SYS_MOUNT_H
-#include <sys/mount.h>
-#endif
-#if HAVE_SYS_SYSCALL_H
-#include <sys/syscall.h>
-#endif
-#if HAVE_SCHED_H
-#include <sched.h>
-#endif
-
-/* In GNU libc 2.11, <sys/mount.h> does not define `MS_PRIVATE', but
-   <linux/fs.h> does.  */
-#if !defined MS_PRIVATE && defined HAVE_LINUX_FS_H
-#include <linux/fs.h>
-#endif
-
-#define CHROOT_ENABLED HAVE_CHROOT && HAVE_SYS_MOUNT_H && defined(MS_BIND) && defined(MS_PRIVATE) && defined(CLONE_NEWNS) && defined(SYS_pivot_root)
-
 /* chroot-like behavior from Apple's sandbox */
 #if __APPLE__
-    #define SANDBOX_ENABLED 1
     #define DEFAULT_ALLOWED_IMPURE_PREFIXES "/System/Library /usr/lib /dev /bin/sh"
 #else
-    #define SANDBOX_ENABLED 0
-    #define DEFAULT_ALLOWED_IMPURE_PREFIXES "/bin" "/usr/bin"
+    #define DEFAULT_ALLOWED_IMPURE_PREFIXES ""
 #endif
 
-#if CHROOT_ENABLED
+/* Includes required for chroot support. */
+#if __linux__
 #include <sys/socket.h>
 #include <sys/ioctl.h>
 #include <net/if.h>
 #include <netinet/ip.h>
-#endif
-
-#if __linux__
 #include <sys/personality.h>
+#include <sys/mman.h>
+#include <sched.h>
+#include <sys/param.h>
+#include <sys/mount.h>
+#include <sys/syscall.h>
+#include <linux/fs.h>
+#define pivot_root(new_root, put_old) (syscall(SYS_pivot_root, new_root, put_old))
 #endif
 
 #if HAVE_STATVFS
@@ -640,11 +621,15 @@ HookInstance::HookInstance()
         if (dup2(builderOut.writeSide, 4) == -1)
             throw SysError("dupping builder's stdout/stderr");
 
-        execl(buildHook.c_str(), buildHook.c_str(), settings.thisSystem.c_str(),
-            (format("%1%") % settings.maxSilentTime).str().c_str(),
-            (format("%1%") % settings.printBuildTrace).str().c_str(),
-            (format("%1%") % settings.buildTimeout).str().c_str(),
-            NULL);
+        Strings args = {
+            baseNameOf(buildHook),
+            settings.thisSystem,
+            (format("%1%") % settings.maxSilentTime).str(),
+            (format("%1%") % settings.printBuildTrace).str(),
+            (format("%1%") % settings.buildTimeout).str()
+        };
+
+        execv(buildHook.c_str(), stringsToCharPtrs(args).data());
 
         throw SysError(format("executing ‘%1%’") % buildHook);
     });
@@ -744,6 +729,9 @@ private:
     /* The temporary directory. */
     Path tmpDir;
 
+    /* The path of the temporary directory in the sandbox. */
+    Path tmpDirInSandbox;
+
     /* File descriptor for the log file. */
     FILE * fLogFile = 0;
     BZFILE * bzLogFile = 0;
@@ -778,6 +766,12 @@ private:
     typedef map<string, string> Environment;
     Environment env;
 
+#if __APPLE__
+    typedef string SandboxProfile;
+    SandboxProfile additionalSandboxProfile;
+    AutoDelete autoDelSandbox;
+#endif
+
     /* Hash rewriting. */
     HashRewrites rewritesToTmp, rewritesFromTmp;
     typedef map<Path, Path> RedirectedOutputs;
@@ -790,12 +784,18 @@ private:
        temporary paths. */
     PathSet redirectedBadOutputs;
 
-    /* Set of inodes seen during calls to canonicalisePathMetaData()
-       for this build's outputs.  This needs to be shared between
-       outputs to allow hard links between outputs. */
-    InodesSeen inodesSeen;
-
     BuildResult result;
+
+    /* The current round, if we're building multiple times. */
+    unsigned int curRound = 1;
+
+    unsigned int nrRounds;
+
+    /* Path registration info from the previous round, if we're
+       building multiple times. Since this contains the hash, it
+       allows us to compare whether two rounds produced the same
+       result. */
+    ValidPathInfos prevInfos;
 
 public:
     DerivationGoal(const Path & drvPath, const StringSet & wantedOutputs,
@@ -806,7 +806,7 @@ public:
 
     void timedOut() override;
 
-    string key()
+    string key() override
     {
         /* Ensure that derivations get built in order of their name,
            i.e. a derivation named "aardvark" always comes before
@@ -815,7 +815,7 @@ public:
         return "b$" + storePathToName(drvPath) + "$" + drvPath;
     }
 
-    void work();
+    void work() override;
 
     Path getDrvPath()
     {
@@ -863,8 +863,8 @@ private:
     void deleteTmpDir(bool force);
 
     /* Callback used by the worker to write to the log. */
-    void handleChildOutput(int fd, const string & data);
-    void handleEOF(int fd);
+    void handleChildOutput(int fd, const string & data) override;
+    void handleEOF(int fd) override;
 
     /* Return the set of (in)valid paths. */
     PathSet checkPathValidity(bool returnValid, bool checkHash);
@@ -1127,8 +1127,10 @@ void DerivationGoal::repairClosure()
 
     /* Get the output closure. */
     PathSet outputClosure;
-    for (auto & i : drv->outputs)
+    for (auto & i : drv->outputs) {
+        if (!wantOutput(i.first, wantedOutputs)) continue;
         computeFSClosure(worker.store, i.second.path, outputClosure);
+    }
 
     /* Filter out our own outputs (which we have already checked). */
     for (auto & i : drv->outputs)
@@ -1237,6 +1239,10 @@ void DerivationGoal::inputsRealised()
     for (auto & i : drv->outputs)
         if (i.second.hash == "") fixedOutput = false;
 
+    /* Don't repeat fixed-output derivations since they're already
+       verified by their output hash.*/
+    nrRounds = fixedOutput ? 1 : settings.get("build-repeat", 0) + 1;
+
     /* Okay, try to build.  Note that here we don't wait for a build
        slot to become available, since we don't need one if there is a
        build hook. */
@@ -1245,11 +1251,22 @@ void DerivationGoal::inputsRealised()
 }
 
 
-static bool canBuildLocally(const string & platform)
+static bool isBuiltin(const BasicDerivation & drv)
 {
-    return platform == settings.thisSystem
+    return string(drv.builder, 0, 8) == "builtin:";
+}
+
+
+static bool canBuildLocally(const BasicDerivation & drv)
+{
+    return drv.platform == settings.thisSystem
+        || isBuiltin(drv)
 #if __linux__
-        || (platform == "i686-linux" && settings.thisSystem == "x86_64-linux")
+        || (drv.platform == "i686-linux" && settings.thisSystem == "x86_64-linux")
+        || (drv.platform == "armv6l-linux" && settings.thisSystem == "armv7l-linux")
+#elif __FreeBSD__
+        || (drv.platform == "i686-linux" && settings.thisSystem == "x86_64-freebsd")
+        || (drv.platform == "i686-linux" && settings.thisSystem == "i686-freebsd")
 #endif
         ;
 }
@@ -1264,19 +1281,13 @@ static string get(const StringPairs & map, const string & key, const string & de
 
 bool willBuildLocally(const BasicDerivation & drv)
 {
-    return get(drv.env, "preferLocalBuild") == "1" && canBuildLocally(drv.platform);
+    return get(drv.env, "preferLocalBuild") == "1" && canBuildLocally(drv);
 }
 
 
 bool substitutesAllowed(const BasicDerivation & drv)
 {
     return get(drv.env, "allowSubstitutes", "1") == "1";
-}
-
-
-static bool isBuiltin(const BasicDerivation & drv)
-{
-    return string(drv.builder, 0, 8) == "builtin:";
 }
 
 
@@ -1315,7 +1326,6 @@ void DerivationGoal::tryToBuild()
        now hold the locks on the output paths, no other process can
        build this derivation, so no further checks are necessary. */
     validPaths = checkPathValidity(true, buildMode == bmRepair);
-    assert(buildMode != bmCheck || validPaths.size() == drv->outputs.size());
     if (buildMode != bmCheck && validPaths.size() == drv->outputs.size()) {
         debug(format("skipping build of derivation ‘%1%’, someone beat us to it") % drvPath);
         outputLocks.setDeletion(true);
@@ -1417,6 +1427,9 @@ void replaceValidPath(const Path & storePath, const Path tmpPath)
 }
 
 
+MakeError(NotDeterministic, BuildError)
+
+
 void DerivationGoal::buildDone()
 {
     trace("build done");
@@ -1516,6 +1529,15 @@ void DerivationGoal::buildDone()
 
         deleteTmpDir(true);
 
+        /* Repeat the build if necessary. */
+        if (curRound++ < nrRounds) {
+            outputLocks.unlock();
+            buildUser.release();
+            state = &DerivationGoal::tryToBuild;
+            worker.wakeUp(shared_from_this());
+            return;
+        }
+
         /* It is now safe to delete the lock files, since all future
            lockers will see that the output paths are valid; they will
            not create new lock files with the same names as the old
@@ -1549,6 +1571,7 @@ void DerivationGoal::buildDone()
                     % drvPath % 1 % e.msg());
 
             st =
+                dynamic_cast<NotDeterministic*>(&e) ? BuildResult::NotDeterministic :
                 statusOk(status) ? BuildResult::OutputRejected :
                 fixedOutput || diskFull ? BuildResult::TransientFailure :
                 BuildResult::PermanentFailure;
@@ -1675,13 +1698,16 @@ int childEntry(void * arg)
 
 void DerivationGoal::startBuilder()
 {
-    startNest(nest, lvlInfo, format(
-            buildMode == bmRepair ? "repairing path(s) %1%" :
-            buildMode == bmCheck ? "checking path(s) %1%" :
-            "building path(s) %1%") % showPaths(missingPaths));
+    auto f = format(
+        buildMode == bmRepair ? "repairing path(s) %1%" :
+        buildMode == bmCheck ? "checking path(s) %1%" :
+        nrRounds > 1 ? "building path(s) %1% (round %2%/%3%)" :
+        "building path(s) %1%");
+    f.exceptions(boost::io::all_error_bits ^ boost::io::too_many_args_bit);
+    startNest(nest, lvlInfo, f % showPaths(missingPaths) % curRound % nrRounds);
 
     /* Right platform? */
-    if (!canBuildLocally(drv->platform)) {
+    if (!canBuildLocally(*drv)) {
         if (settings.printBuildTrace)
             printMsg(lvlError, format("@ unsupported-platform %1% %2%") % drvPath % drv->platform);
         throw Error(
@@ -1689,7 +1715,40 @@ void DerivationGoal::startBuilder()
             % drv->platform % settings.thisSystem % drvPath);
     }
 
+#if __APPLE__
+    additionalSandboxProfile = get(drv->env, "__sandboxProfile");
+#endif
+
+    /* Are we doing a chroot build?  Note that fixed-output
+       derivations are never done in a chroot, mainly so that
+       functions like fetchurl (which needs a proper /etc/resolv.conf)
+       work properly.  Purity checking for fixed-output derivations
+       is somewhat pointless anyway. */
+    {
+        string x = settings.get("build-use-sandbox",
+            /* deprecated alias */
+            settings.get("build-use-chroot", string("false")));
+        if (x != "true" && x != "false" && x != "relaxed")
+            throw Error("option ‘build-use-sandbox’ must be set to one of ‘true’, ‘false’ or ‘relaxed’");
+        if (x == "true") {
+            if (get(drv->env, "__noChroot") == "1")
+                throw Error(format("derivation ‘%1%’ has ‘__noChroot’ set, "
+                    "but that's not allowed when ‘build-use-sandbox’ is ‘true’") % drvPath);
+#if __APPLE__
+            if (additionalSandboxProfile != "")
+                throw Error(format("derivation ‘%1%’ specifies a sandbox profile, "
+                    "but this is only allowed when ‘build-use-sandbox’ is ‘relaxed’") % drvPath);
+#endif
+            useChroot = true;
+        }
+        else if (x == "false")
+            useChroot = false;
+        else if (x == "relaxed")
+            useChroot = !fixedOutput && get(drv->env, "__noChroot") != "1";
+    }
+
     /* Construct the environment passed to the builder. */
+    env.clear();
 
     /* Most shells initialise PATH to some default (/bin:/usr/bin:...) when
        PATH is not set.  We don't want this, so we fill it in with some dummy
@@ -1716,7 +1775,12 @@ void DerivationGoal::startBuilder()
 
     /* Create a temporary directory where the build will take
        place. */
-    tmpDir = createTempDir("", "nix-build-" + storePathToName(drvPath), false, false, 0700);
+    auto drvName = storePathToName(drvPath);
+    tmpDir = createTempDir("", "nix-build-" + drvName, false, false, 0700);
+
+    /* In a sandbox, for determinism, always use the same temporary
+       directory. */
+    tmpDirInSandbox = useChroot ? canonPath("/tmp", true) + "/nix-build-" + drvName + "-0" : tmpDir;
 
     /* Add all bindings specified in the derivation via the
        environments, except those listed in the passAsFile
@@ -1729,25 +1793,26 @@ void DerivationGoal::startBuilder()
         if (passAsFile.find(i.first) == passAsFile.end()) {
             env[i.first] = i.second;
         } else {
-            Path p = tmpDir + "/.attr-" + int2String(fileNr++);
+            string fn = ".attr-" + std::to_string(fileNr++);
+            Path p = tmpDir + "/" + fn;
             writeFile(p, i.second);
             filesToChown.insert(p);
-            env[i.first + "Path"] = p;
+            env[i.first + "Path"] = tmpDirInSandbox + "/" + fn;
         }
     }
 
     /* For convenience, set an environment pointing to the top build
        directory. */
-    env["NIX_BUILD_TOP"] = tmpDir;
+    env["NIX_BUILD_TOP"] = tmpDirInSandbox;
 
     /* Also set TMPDIR and variants to point to this directory. */
-    env["TMPDIR"] = env["TEMPDIR"] = env["TMP"] = env["TEMP"] = tmpDir;
+    env["TMPDIR"] = env["TEMPDIR"] = env["TMP"] = env["TEMP"] = tmpDirInSandbox;
 
     /* Explicitly set PWD to prevent problems with chroot builds.  In
        particular, dietlibc cannot figure out the cwd because the
        inode of the current directory doesn't appear in .. (because
        getdents returns the inode of the mount point). */
-    env["PWD"] = tmpDir;
+    env["PWD"] = tmpDirInSandbox;
 
     /* Compatibility hack with Nix <= 0.7: if this is a fixed-output
        derivation, tell the builder, so that for instance `fetchurl'
@@ -1836,39 +1901,26 @@ void DerivationGoal::startBuilder()
     }
 
 
-    /* Are we doing a chroot build?  Note that fixed-output
-       derivations are never done in a chroot, mainly so that
-       functions like fetchurl (which needs a proper /etc/resolv.conf)
-       work properly.  Purity checking for fixed-output derivations
-       is somewhat pointless anyway. */
-    {
-        string x = settings.get("build-use-chroot", string("false"));
-        if (x != "true" && x != "false" && x != "relaxed")
-            throw Error("option ‘build-use-chroot’ must be set to one of ‘true’, ‘false’ or ‘relaxed’");
-        if (x == "true") {
-            if (get(drv->env, "__noChroot") == "1")
-                throw Error(format("derivation ‘%1%’ has ‘__noChroot’ set, but that's not allowed when ‘build-use-chroot’ is ‘true’") % drvPath);
-            useChroot = true;
-        }
-        else if (x == "false")
-            useChroot = false;
-        else if (x == "relaxed")
-            useChroot = !fixedOutput && get(drv->env, "__noChroot") != "1";
-    }
-
     if (useChroot) {
 
         string defaultChrootDirs;
-#if CHROOT_ENABLED
+#if __linux__
         if (isInStore(BASH_PATH))
             defaultChrootDirs = "/bin/sh=" BASH_PATH;
 #endif
 
         /* Allow a user-configurable set of directories from the
            host file system. */
-        PathSet dirs = tokenizeString<StringSet>(settings.get("build-chroot-dirs", defaultChrootDirs));
-        PathSet dirs2 = tokenizeString<StringSet>(settings.get("build-extra-chroot-dirs", string("")));
+        PathSet dirs = tokenizeString<StringSet>(
+            settings.get("build-sandbox-paths",
+                /* deprecated alias with lower priority */
+                settings.get("build-chroot-dirs", defaultChrootDirs)));
+        PathSet dirs2 = tokenizeString<StringSet>(
+            settings.get("build-extra-chroot-dirs",
+                settings.get("build-extra-sandbox-paths", string(""))));
         dirs.insert(dirs2.begin(), dirs2.end());
+
+        dirsInChroot.clear();
 
         for (auto & i : dirs) {
             size_t p = i.find('=');
@@ -1877,7 +1929,7 @@ void DerivationGoal::startBuilder()
             else
                 dirsInChroot[string(i, 0, p)] = string(i, p + 1);
         }
-        dirsInChroot[tmpDir] = tmpDir;
+        dirsInChroot[tmpDirInSandbox] = tmpDir;
 
         /* Add the closure of store paths to the chroot. */
         PathSet closure;
@@ -1908,12 +1960,12 @@ void DerivationGoal::startBuilder()
                 }
             }
             if (!found)
-                throw Error(format("derivation '%1%' requested impure path ‘%2%’, but it was not in allowed-impure-host-deps (‘%3%’)") % drvPath % i % allowed);
+                throw Error(format("derivation ‘%1%’ requested impure path ‘%2%’, but it was not in allowed-impure-host-deps (‘%3%’)") % drvPath % i % allowed);
 
             dirsInChroot[i] = i;
         }
 
-#if CHROOT_ENABLED
+#if __linux__
         /* Create a temporary directory in which we set up the chroot
            environment using bind-mounts.  We put it in the Nix store
            to ensure that we can create hard-links to non-directory
@@ -2006,11 +2058,11 @@ void DerivationGoal::startBuilder()
         for (auto & i : drv->outputs)
             dirsInChroot.erase(i.second.path);
 
-#elif SANDBOX_ENABLED
+#elif __APPLE__
         /* We don't really have any parent prep work to do (yet?)
            All work happens in the child, instead. */
 #else
-        throw Error("chroot builds are not supported on this platform");
+        throw Error("sandboxing builds is not supported on this platform");
 #endif
     }
 
@@ -2056,10 +2108,10 @@ void DerivationGoal::startBuilder()
         auto lastPos = std::string::size_type{0};
         for (auto nlPos = lines.find('\n'); nlPos != string::npos;
                 nlPos = lines.find('\n', lastPos)) {
-            auto line = std::string{lines, lastPos, nlPos};
+            auto line = std::string{lines, lastPos, nlPos - lastPos};
             lastPos = nlPos + 1;
             if (state == stBegin) {
-                if (line == "extra-chroot-dirs") {
+                if (line == "extra-sandbox-paths" || line == "extra-chroot-dirs") {
                     state = stExtraChrootDirs;
                 } else {
                     throw Error(format("unknown pre-build hook command ‘%1%’")
@@ -2089,7 +2141,7 @@ void DerivationGoal::startBuilder()
     builderOut.create();
 
     /* Fork a child to build the package. */
-#if CHROOT_ENABLED
+#if __linux__
     if (useChroot) {
         /* Set up private namespaces for the build:
 
@@ -2127,16 +2179,19 @@ void DerivationGoal::startBuilder()
         ProcessOptions options;
         options.allowVfork = false;
         Pid helper = startProcess([&]() {
-            char stack[32 * 1024];
+            size_t stackSize = 1 * 1024 * 1024;
+            char * stack = (char *) mmap(0, stackSize,
+                PROT_WRITE | PROT_READ, MAP_PRIVATE | MAP_ANONYMOUS | MAP_STACK, -1, 0);
+            if (stack == MAP_FAILED) throw SysError("allocating stack");
             int flags = CLONE_NEWPID | CLONE_NEWNS | CLONE_NEWIPC | CLONE_NEWUTS | CLONE_PARENT | SIGCHLD;
             if (!fixedOutput) flags |= CLONE_NEWNET;
-            pid_t child = clone(childEntry, stack + sizeof(stack) - 8, flags, this);
+            pid_t child = clone(childEntry, stack + stackSize, flags, this);
             if (child == -1 && errno == EINVAL)
                 /* Fallback for Linux < 2.13 where CLONE_NEWPID and
                    CLONE_PARENT are not allowed together. */
-                child = clone(childEntry, stack + sizeof(stack) - 8, flags & ~CLONE_NEWPID, this);
+                child = clone(childEntry, stack + stackSize, flags & ~CLONE_NEWPID, this);
             if (child == -1) throw SysError("cloning builder process");
-            writeFull(builderOut.writeSide, int2String(child) + "\n");
+            writeFull(builderOut.writeSide, std::to_string(child) + "\n");
             _exit(0);
         }, options);
         if (helper.wait(true) != 0)
@@ -2188,7 +2243,7 @@ void DerivationGoal::runChild()
 
         commonChildInit(builderOut);
 
-#if CHROOT_ENABLED
+#if __linux__
         if (useChroot) {
 
             /* Initialise the loopback interface. */
@@ -2321,10 +2376,8 @@ void DerivationGoal::runChild()
             if (mkdir("real-root", 0) == -1)
                 throw SysError("cannot create real-root directory");
 
-#define pivot_root(new_root, put_old) (syscall(SYS_pivot_root, new_root, put_old))
             if (pivot_root(".", "real-root") == -1)
                 throw SysError(format("cannot pivot old root directory onto ‘%1%’") % (chrootRootDir + "/real-root"));
-#undef pivot_root
 
             if (chroot(".") == -1)
                 throw SysError(format("cannot change root directory to ‘%1%’") % chrootRootDir);
@@ -2337,7 +2390,7 @@ void DerivationGoal::runChild()
         }
 #endif
 
-        if (chdir(tmpDir.c_str()) == -1)
+        if (chdir(tmpDirInSandbox.c_str()) == -1)
             throw SysError(format("changing into ‘%1%’") % tmpDir);
 
         /* Close all other file descriptors. */
@@ -2404,9 +2457,10 @@ void DerivationGoal::runChild()
         const char *builder = "invalid";
 
         string sandboxProfile;
-        if (isBuiltin(*drv))
+        if (isBuiltin(*drv)) {
             ;
-        else if (useChroot && SANDBOX_ENABLED) {
+#if __APPLE__
+        } else if (useChroot) {
             /* Lots and lots and lots of file functions freak out if they can't stat their full ancestry */
             PathSet ancestry;
 
@@ -2433,7 +2487,7 @@ void DerivationGoal::runChild()
             for (auto & i : inputPaths)
                 dirsInChroot[i] = i;
 
-            /* TODO: we should factor out the policy cleanly, so we don't have to repeat the constants every time... */
+            /* This has to appear before import statements */
             sandboxProfile += "(version 1)\n";
 
             /* Violations will go to the syslog if you set this. Unfortunately the destination does not appear to be configurable */
@@ -2443,35 +2497,12 @@ void DerivationGoal::runChild()
                 sandboxProfile += "(deny default (with no-log))\n";
             }
 
-            sandboxProfile += "(allow file-read* file-write-data (literal \"/dev/null\"))\n";
-
-            sandboxProfile += "(allow file-read-metadata\n"
-                "\t(literal \"/var\")\n"
-                "\t(literal \"/tmp\")\n"
-                "\t(literal \"/etc\")\n"
-                "\t(literal \"/etc/nix\")\n"
-                "\t(literal \"/etc/nix/nix.conf\"))\n";
-
             /* The tmpDir in scope points at the temporary build directory for our derivation. Some packages try different mechanisms
                to find temporary directories, so we want to open up a broader place for them to dump their files, if needed. */
             Path globalTmpDir = canonPath(getEnv("TMPDIR", "/tmp"), true);
 
             /* They don't like trailing slashes on subpath directives */
             if (globalTmpDir.back() == '/') globalTmpDir.pop_back();
-
-            /* This is where our temp folders are and where most of the building will happen, so we want rwx on it. */
-            sandboxProfile += (format("(allow file-read* file-write* process-exec (subpath \"%1%\") (subpath \"/private/tmp\"))\n") % globalTmpDir).str();
-
-            sandboxProfile += "(allow process-fork)\n";
-            sandboxProfile += "(allow sysctl-read)\n";
-            sandboxProfile += "(allow signal (target same-sandbox))\n";
-
-            /* Enables getpwuid (used by git and others) */
-            sandboxProfile += "(allow mach-lookup (global-name \"com.apple.system.notification_center\") (global-name \"com.apple.system.opendirectoryd.libinfo\"))\n";
-
-            /* Allow local networking operations, mostly because lots of test suites use it and it seems mostly harmless */
-            sandboxProfile += "(allow network* (local ip) (remote unix-socket))";
-
 
             /* Our rwx outputs */
             sandboxProfile += "(allow file-read* file-write* process-exec\n";
@@ -2481,15 +2512,15 @@ void DerivationGoal::runChild()
             sandboxProfile += ")\n";
 
             /* Our inputs (transitive dependencies and any impurities computed above)
-               Note that the sandbox profile allows file-write* even though it isn't seemingly necessary. First of all, nix's standard user permissioning
-               mechanism still prevents builders from writing to input directories, so no security/purity is lost. The reason we allow file-write* is that
-               denying it means the `access` syscall will return EPERM instead of EACCESS, which confuses a few programs that assume (understandably, since
-               it appears to be a violation of the POSIX spec) that `access` won't do that, and don't deal with it nicely if it does. The most notable of
-               these is the entire GHC Haskell ecosystem. */
+
+               without file-write* allowed, access() incorrectly returns EPERM
+             */
             sandboxProfile += "(allow file-read* file-write* process-exec\n";
             for (auto & i : dirsInChroot) {
                 if (i.first != i.second)
-                    throw SysError(format("can't map '%1%' to '%2%': mismatched impure paths not supported on darwin"));
+                    throw Error(format(
+                        "can't map '%1%' to '%2%': mismatched impure paths not supported on Darwin")
+                        % i.first % i.second);
 
                 string path = i.first;
                 struct stat st;
@@ -2502,22 +2533,32 @@ void DerivationGoal::runChild()
             }
             sandboxProfile += ")\n";
 
-            /* Our ancestry. N.B: this uses literal on folders, instead of subpath. Without that,
-               you open up the entire filesystem because you end up with (subpath "/") */
-            sandboxProfile += "(allow file-read-metadata\n";
+            /* Allow file-read* on full directory hierarchy to self. Allows realpath() */
+            sandboxProfile += "(allow file-read*\n";
             for (auto & i : ancestry) {
                 sandboxProfile += (format("\t(literal \"%1%\")\n") % i.c_str()).str();
             }
             sandboxProfile += ")\n";
 
+            sandboxProfile += additionalSandboxProfile;
+
             debug("Generated sandbox profile:");
             debug(sandboxProfile);
 
+            Path sandboxFile = drvPath + ".sb";
+            if (pathExists(sandboxFile)) deletePath(sandboxFile);
+            autoDelSandbox.reset(sandboxFile, false);
+
+            writeFile(sandboxFile, sandboxProfile);
+
             builder = "/usr/bin/sandbox-exec";
             args.push_back("sandbox-exec");
-            args.push_back("-p");
-            args.push_back(sandboxProfile);
+            args.push_back("-f");
+            args.push_back(sandboxFile);
+            args.push_back("-D");
+            args.push_back("_GLOBAL_TMP_DIR=" + globalTmpDir);
             args.push_back(drv->builder);
+#endif
         } else {
             builder = drv->builder.c_str();
             string builderBasename = baseNameOf(drv->builder);
@@ -2591,6 +2632,13 @@ void DerivationGoal::registerOutputs()
 
     ValidPathInfos infos;
 
+    /* Set of inodes seen during calls to canonicalisePathMetaData()
+       for this build's outputs.  This needs to be shared between
+       outputs to allow hard links between outputs. */
+    InodesSeen inodesSeen;
+
+    Path checkSuffix = "-check";
+
     /* Check whether the output paths were created, and grep each
        output path to determine what other paths it references.  Also make all
        output paths read-only. */
@@ -2607,7 +2655,7 @@ void DerivationGoal::registerOutputs()
                     replaceValidPath(path, actualPath);
                 else
                     if (buildMode != bmCheck && rename(actualPath.c_str(), path.c_str()) == -1)
-                        throw SysError(format("moving build output ‘%1%’ from the chroot to the Nix store") % path);
+                        throw SysError(format("moving build output ‘%1%’ from the sandbox to the Nix store") % path);
             }
             if (buildMode != bmCheck) actualPath = path;
         } else {
@@ -2616,7 +2664,7 @@ void DerivationGoal::registerOutputs()
                 && redirectedBadOutputs.find(path) != redirectedBadOutputs.end()
                 && pathExists(redirected))
                 replaceValidPath(path, redirected);
-            if (buildMode == bmCheck)
+            if (buildMode == bmCheck && redirected != "")
                 actualPath = redirected;
         }
 
@@ -2683,8 +2731,8 @@ void DerivationGoal::registerOutputs()
             Hash h2 = recursive ? hashPath(ht, actualPath).first : hashFile(ht, actualPath);
             if (h != h2)
                 throw BuildError(
-                    format("output path ‘%1%’ should have %2% hash ‘%3%’, instead has ‘%4%’")
-                    % path % i.second.hashAlgo % printHash16or32(h) % printHash16or32(h2));
+                    format("output path ‘%1%’ has %2% hash ‘%3%’ when ‘%4%’ was expected")
+                    % path % i.second.hashAlgo % printHash16or32(h2) % printHash16or32(h));
         }
 
         /* Get rid of all weird permissions.  This also checks that
@@ -2700,9 +2748,20 @@ void DerivationGoal::registerOutputs()
         PathSet references = scanForReferences(actualPath, allPaths, hash);
 
         if (buildMode == bmCheck) {
+            if (!store->isValidPath(path)) continue;
             ValidPathInfo info = worker.store.queryPathInfo(path);
-            if (hash.first != info.hash)
-                throw Error(format("derivation ‘%1%’ may not be deterministic: hash mismatch in output ‘%2%’") % drvPath % path);
+            if (hash.first != info.hash) {
+                if (settings.keepFailed) {
+                    Path dst = path + checkSuffix;
+                    if (pathExists(dst)) deletePath(dst);
+                    if (rename(actualPath.c_str(), dst.c_str()))
+                        throw SysError(format("renaming ‘%1%’ to ‘%2%’") % actualPath % dst);
+                    throw Error(format("derivation ‘%1%’ may not be deterministic: output ‘%2%’ differs from ‘%3%’")
+                        % drvPath % path % dst);
+                } else
+                    throw Error(format("derivation ‘%1%’ may not be deterministic: output ‘%2%’ differs")
+                        % drvPath % path);
+            }
             continue;
         }
 
@@ -2747,9 +2806,11 @@ void DerivationGoal::registerOutputs()
         checkRefs("disallowedReferences", false, false);
         checkRefs("disallowedRequisites", false, true);
 
-        worker.store.optimisePath(path); // FIXME: combine with scanForReferences()
+        if (curRound == nrRounds) {
+            worker.store.optimisePath(path); // FIXME: combine with scanForReferences()
 
-        worker.store.markContentsGood(path);
+            worker.store.markContentsGood(path);
+        }
 
         ValidPathInfo info;
         info.path = path;
@@ -2761,6 +2822,43 @@ void DerivationGoal::registerOutputs()
     }
 
     if (buildMode == bmCheck) return;
+
+    /* Compare the result with the previous round, and report which
+       path is different, if any.*/
+    if (curRound > 1 && prevInfos != infos) {
+        assert(prevInfos.size() == infos.size());
+        for (auto i = prevInfos.begin(), j = infos.begin(); i != prevInfos.end(); ++i, ++j)
+            if (!(*i == *j)) {
+                Path prev = i->path + checkSuffix;
+                if (pathExists(prev))
+                    throw NotDeterministic(
+                        format("output ‘%1%’ of ‘%2%’ differs from ‘%3%’ from previous round")
+                        % i->path % drvPath % prev);
+                else
+                    throw NotDeterministic(
+                        format("output ‘%1%’ of ‘%2%’ differs from previous round")
+                        % i->path % drvPath);
+            }
+        assert(false); // shouldn't happen
+    }
+
+    if (settings.keepFailed) {
+        for (auto & i : drv->outputs) {
+            Path prev = i.second.path + checkSuffix;
+            if (pathExists(prev)) deletePath(prev);
+            if (curRound < nrRounds) {
+                Path dst = i.second.path + checkSuffix;
+                if (rename(i.second.path.c_str(), dst.c_str()))
+                    throw SysError(format("renaming ‘%1%’ to ‘%2%’") % i.second.path % dst);
+            }
+        }
+
+    }
+
+    if (curRound < nrRounds) {
+        prevInfos = infos;
+        return;
+    }
 
     /* Register each output path as valid, and register the sets of
        paths referenced by each of them.  If there are cycles in the
@@ -2854,7 +2952,8 @@ void DerivationGoal::handleChildOutput(int fd, const string & data)
             printMsg(lvlError,
                 format("%1% killed after writing more than %2% bytes of log output")
                 % getName() % settings.maxLogSize);
-            timedOut(); // not really a timeout, but close enough
+            killChild();
+            done(BuildResult::LogLimitExceeded);
             return;
         }
         if (verbosity >= settings.buildVerbosity)
@@ -3077,6 +3176,7 @@ void SubstitutionGoal::tryNext()
         /* None left.  Terminate this goal and let someone else deal
            with it. */
         debug(format("path ‘%1%’ is required, but there is no substituter that can build it") % storePath);
+
         /* Hack: don't indicate failure if there were no substituters.
            In that case the calling derivation should just do a
            build. */
@@ -3676,7 +3776,7 @@ void Worker::waitForInput()
         }
     }
 
-    if (!waitingForAWhile.empty() && lastWokenUp + settings.pollInterval <= after) {
+    if (!waitingForAWhile.empty() && lastWokenUp + (time_t) settings.pollInterval <= after) {
         lastWokenUp = after;
         for (auto & i : waitingForAWhile) {
             GoalPtr goal = i.lock();
@@ -3772,8 +3872,17 @@ void LocalStore::repairPath(const Path & path)
 
     worker.run(goals);
 
-    if (goal->getExitCode() != Goal::ecSuccess)
-        throw Error(format("cannot repair path ‘%1%’") % path, worker.exitStatus());
+    if (goal->getExitCode() != Goal::ecSuccess) {
+        /* Since substituting the path didn't work, if we have a valid
+           deriver, then rebuild the deriver. */
+        Path deriver = queryDeriver(path);
+        if (deriver != "" && isValidPath(deriver)) {
+            goals.clear();
+            goals.insert(worker.makeDerivationGoal(deriver, StringSet(), bmRepair));
+            worker.run(goals);
+        } else
+            throw Error(format("cannot repair path ‘%1%’") % path, worker.exitStatus());
+    }
 }
 
 

@@ -232,7 +232,13 @@ DirEntries readDirectory(const Path & path)
         checkInterrupt();
         string name = dirent->d_name;
         if (name == "." || name == "..") continue;
-        entries.emplace_back(name, dirent->d_ino, dirent->d_type);
+        entries.emplace_back(name, dirent->d_ino,
+#ifdef HAVE_STRUCT_DIRENT_D_TYPE
+            dirent->d_type
+#else
+            DT_UNKNOWN
+#endif
+        );
     }
     if (errno) throw SysError(format("reading directory ‘%1%’") % path);
 
@@ -453,7 +459,7 @@ Nest::~Nest()
 
 static string escVerbosity(Verbosity level)
 {
-    return int2String((int) level);
+    return std::to_string((int) level);
 }
 
 
@@ -599,6 +605,8 @@ string drainFD(int fd)
 //////////////////////////////////////////////////////////////////////
 
 
+AutoDelete::AutoDelete() : del{false} {}
+
 AutoDelete::AutoDelete(const string & p, bool recursive) : path(p)
 {
     del = true;
@@ -624,6 +632,12 @@ AutoDelete::~AutoDelete()
 void AutoDelete::cancel()
 {
     del = false;
+}
+
+void AutoDelete::reset(const Path & p, bool recursive) {
+    path = p;
+    this->recursive = recursive;
+    del = true;
 }
 
 

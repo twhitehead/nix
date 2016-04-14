@@ -570,14 +570,16 @@ static void upgradeDerivations(Globals & globals,
                    constraints specified by upgradeType.  If there are
                    multiple matches, take the one with the highest
                    priority.  If there are still multiple matches,
-                   take the one with the highest version. */
+                   take the one with the highest version.
+                   Do not upgrade if it would decrease the priority. */
                 DrvInfos::iterator bestElem = availElems.end();
-                DrvName bestName;
+                string bestVersion;
                 for (auto j = availElems.begin(); j != availElems.end(); ++j) {
+                    if (comparePriorities(*globals.state, i, *j) > 0)
+                        continue;
                     DrvName newName(j->name);
                     if (newName.name == drvName.name) {
-                        int d = comparePriorities(*globals.state, i, *j);
-                        if (d == 0) d = compareVersions(drvName.version, newName.version);
+                        int d = compareVersions(drvName.version, newName.version);
                         if ((upgradeType == utLt && d < 0) ||
                             (upgradeType == utLeq && d <= 0) ||
                             (upgradeType == utEq && d == 0) ||
@@ -586,11 +588,11 @@ static void upgradeDerivations(Globals & globals,
                             int d2 = -1;
                             if (bestElem != availElems.end()) {
                                 d2 = comparePriorities(*globals.state, *bestElem, *j);
-                                if (d2 == 0) d2 = compareVersions(bestName.version, newName.version);
+                                if (d2 == 0) d2 = compareVersions(bestVersion, newName.version);
                             }
                             if (d2 < 0 && (!globals.prebuiltOnly || isPrebuilt(*globals.state, *j))) {
                                 bestElem = j;
-                                bestName = newName;
+                                bestVersion = newName.version;
                             }
                         }
                     }
@@ -600,9 +602,11 @@ static void upgradeDerivations(Globals & globals,
                     i.queryOutPath() !=
                     bestElem->queryOutPath())
                 {
+                    const char * action = compareVersions(drvName.version, bestVersion) <= 0
+                        ? "upgrading" : "downgrading";
                     printMsg(lvlInfo,
-                        format("upgrading ‘%1%’ to ‘%2%’")
-                        % i.name % bestElem->name);
+                        format("%1% ‘%2%’ to ‘%3%’")
+                        % action % i.name % bestElem->name);
                     newElems.push_back(*bestElem);
                 } else newElems.push_back(i);
 
@@ -1136,7 +1140,19 @@ static void opQuery(Globals & globals, Strings opFlags, Strings opArgs)
                                         attrs3["value"] = v->listElems()[j]->string.s;
                                         xml.writeEmptyElement("string", attrs3);
                                     }
+                              } else if (v->type == tAttrs) {
+                                  attrs2["type"] = "strings";
+                                  XMLOpenElement m(xml, "meta", attrs2);
+                                  Bindings & attrs = *v->attrs;
+                                  for (auto &i : attrs) {
+                                      Attr & a(*attrs.find(i.name));
+                                      if(a.value->type != tString) continue;
+                                      XMLAttrs attrs3;
+                                      attrs3["type"] = i.name;
+                                      attrs3["value"] = a.value->string.s;
+                                      xml.writeEmptyElement("string", attrs3);
                                 }
+                              }
                             }
                         }
                     }
@@ -1273,7 +1289,7 @@ static void opDeleteGenerations(Globals & globals, Strings opFlags, Strings opAr
         std::set<unsigned int> gens;
         for (auto & i : opArgs) {
             unsigned int n;
-            if (!string2Int(i, n) || n < 0)
+            if (!string2Int(i, n))
                 throw UsageError(format("invalid generation number ‘%1%’") % i);
             gens.insert(n);
         }

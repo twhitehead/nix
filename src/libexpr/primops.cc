@@ -248,7 +248,7 @@ struct CompareValues
     bool operator () (const Value * v1, const Value * v2) const
     {
         if (v1->type != v2->type)
-            throw EvalError("cannot compare values of different types");
+            throw EvalError(format("cannot compare %1% with %2%") % showType(*v1) % showType(*v2));
         switch (v1->type) {
             case tInt:
                 return v1->integer < v2->integer;
@@ -1154,7 +1154,7 @@ static void prim_catAttrs(EvalState & state, const Pos & pos, Value * * args, Va
 
 /* Return a set containing the names of the formal arguments expected
    by the function `f'.  The value of each attribute is a Boolean
-   denoting whether has a default value.  For instance,
+   denoting whether the corresponding argument has a default value.  For instance,
 
       functionArgs ({ x, y ? 123}: ...)
    => { x = false; y = true; }
@@ -1374,7 +1374,7 @@ static void prim_genList(EvalState & state, const Pos & pos, Value * * args, Val
 
     state.mkList(v, len);
 
-    for (unsigned int n = 0; n < len; ++n) {
+    for (unsigned int n = 0; n < (unsigned int) len; ++n) {
         Value * arg = state.allocValue();
         mkInt(*arg, n);
         mkApp(*(v.listElems()[n] = state.allocValue()), *args[0], *arg);

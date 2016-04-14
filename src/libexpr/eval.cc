@@ -261,6 +261,7 @@ EvalState::EvalState(const Strings & _searchPath)
     , sLine(symbols.create("line"))
     , sColumn(symbols.create("column"))
     , sFunctor(symbols.create("__functor"))
+    , sToString(symbols.create("__toString"))
     , baseEnv(allocEnv(128))
     , staticBaseEnv(false, 0)
 {
@@ -1032,6 +1033,17 @@ void EvalState::autoCallFunction(Bindings & args, Value & fun, Value & res)
 {
     forceValue(fun);
 
+    if (fun.type == tAttrs) {
+        auto found = fun.attrs->find(sFunctor);
+        if (found != fun.attrs->end()) {
+            forceValue(*found->value);
+            Value * v = allocValue();
+            callFunction(*found->value, fun, *v, noPos);
+            forceValue(*v);
+            return autoCallFunction(args, *v, res);
+        }
+    }
+
     if (fun.type != tLambda || !fun.lambda.fun->matchAttrs) {
         res = fun;
         return;
@@ -1291,10 +1303,16 @@ bool EvalState::forceBool(Value & v)
 }
 
 
+bool EvalState::isFunctor(Value & fun)
+{
+    return fun.type == tAttrs && fun.attrs->find(sFunctor) != fun.attrs->end();
+}
+
+
 void EvalState::forceFunction(Value & v, const Pos & pos)
 {
     forceValue(v);
-    if (v.type != tLambda && v.type != tPrimOp && v.type != tPrimOpApp)
+    if (v.type != tLambda && v.type != tPrimOp && v.type != tPrimOpApp && !isFunctor(v))
         throwTypeError("value is %1% while a function was expected, at %2%", v, pos);
 }
 
@@ -1372,7 +1390,14 @@ string EvalState::coerceToString(const Pos & pos, Value & v, PathSet & context,
     }
 
     if (v.type == tAttrs) {
-        Bindings::iterator i = v.attrs->find(sOutPath);
+        auto i = v.attrs->find(sToString);
+        if (i != v.attrs->end()) {
+            forceValue(*i->value, pos);
+            Value v1;
+            callFunction(*i->value, v, v1, pos);
+            return coerceToString(pos, v1, context, coerceMore, copyToStore);
+        }
+        i = v.attrs->find(sOutPath);
         if (i == v.attrs->end()) throwTypeError("cannot coerce a set to a string, at %1%", pos);
         return coerceToString(pos, *i->value, context, coerceMore, copyToStore);
     }
@@ -1386,7 +1411,7 @@ string EvalState::coerceToString(const Pos & pos, Value & v, PathSet & context,
            shell scripting convenience, just like `null'. */
         if (v.type == tBool && v.boolean) return "1";
         if (v.type == tBool && !v.boolean) return "";
-        if (v.type == tInt) return int2String(v.integer);
+        if (v.type == tInt) return std::to_string(v.integer);
         if (v.type == tNull) return "";
 
         if (v.isList()) {

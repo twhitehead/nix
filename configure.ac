@@ -48,6 +48,7 @@ test "$localstatedir" = '${prefix}/var' && localstatedir=/nix/var
 
 
 # Solaris-specific stuff.
+AC_STRUCT_DIRENT_D_TYPE
 if test "$sys_name" = sunos; then
     # Solaris requires -lsocket -lnsl for network functions
     LIBS="-lsocket -lnsl $LIBS"
@@ -76,27 +77,12 @@ static char buf[1024];]],
 AC_LANG_POP(C++)
 
 
-# Check for chroot support (requires chroot() and bind mounts).
-AC_CHECK_FUNCS([chroot])
-AC_CHECK_FUNCS([unshare])
 AC_CHECK_FUNCS([statvfs])
-AC_CHECK_HEADERS([sched.h])
-AC_CHECK_HEADERS([sys/param.h])
-AC_CHECK_HEADERS([sys/mount.h], [], [],
-[#ifdef HAVE_SYS_PARAM_H
-# include <sys/param.h>
-# endif
-])
-AC_CHECK_HEADERS([sys/syscall.h])
 
 
 # Check for lutimes, optionally used for changing the mtime of
 # symlinks.
 AC_CHECK_FUNCS([lutimes])
-
-
-# Check for sched_setaffinity.
-AC_CHECK_FUNCS([sched_setaffinity])
 
 
 # Check whether the store optimiser can optimise symlinks.
@@ -120,10 +106,6 @@ AC_LANG_POP(C++)
 # Check for <err.h>.
 AC_CHECK_HEADER([err.h], [], [bsddiff_compat_include="-Icompat-include"])
 AC_SUBST([bsddiff_compat_include])
-
-
-# Check for <linux/fs.h> (for immutable file support).
-AC_CHECK_HEADERS([linux/fs.h])
 
 
 AC_DEFUN([NEED_PROG],
@@ -183,16 +165,12 @@ AC_ARG_WITH(store-dir, AC_HELP_STRING([--with-store-dir=PATH],
 AC_SUBST(storedir)
 
 
-# Look for OpenSSL, an optional dependency.
+# Look for OpenSSL, a required dependency.
 AC_PATH_PROG(openssl, openssl, openssl) # if not found, call openssl in $PATH
 AC_SUBST(openssl)
 AC_DEFINE_UNQUOTED(OPENSSL_PATH, ["$openssl"], [Path of the OpenSSL binary])
 
-PKG_CHECK_MODULES([OPENSSL], [libcrypto],
-  [AC_DEFINE([HAVE_OPENSSL], [1], [Whether to use OpenSSL.])
-   CXXFLAGS="$OPENSSL_CFLAGS $CXXFLAGS"
-   have_openssl=1], [have_openssl=])
-AC_SUBST(HAVE_OPENSSL, [$have_openssl])
+PKG_CHECK_MODULES([OPENSSL], [libcrypto], [CXXFLAGS="$OPENSSL_CFLAGS $CXXFLAGS"])
 
 
 # Look for libbz2, a required dependency.
@@ -216,6 +194,10 @@ PKG_CHECK_MODULES([SODIUM], [libsodium],
    CXXFLAGS="$SODIUM_CFLAGS $CXXFLAGS"
    have_sodium=1], [have_sodium=])
 AC_SUBST(HAVE_SODIUM, [$have_sodium])
+
+
+# Look for liblzma, a required dependency.
+PKG_CHECK_MODULES([LIBLZMA], [liblzma], [CXXFLAGS="$LIBLZMA_CFLAGS $CXXFLAGS"])
 
 
 # Whether to use the Boehm garbage collector.
@@ -259,6 +241,23 @@ fi
 AC_MSG_RESULT(yes)
 
 AC_SUBST(perlFlags)
+
+
+# Check for otool, an optional dependency on Darwin.
+AC_PATH_PROG(otool, otool)
+AC_MSG_CHECKING([that otool works])
+case $host_os in
+  darwin*)
+    if test -z "$otool" || ! $otool --version 2>/dev/null; then
+      AC_MSG_RESULT(no)
+      AC_MSG_ERROR([Can't get version from otool; do you need to install developer tools?])
+    fi
+    AC_MSG_RESULT(yes)
+    ;;
+  *)
+    AC_MSG_RESULT(not needed)
+    ;;
+esac
 
 
 # Whether to build the Perl bindings

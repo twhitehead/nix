@@ -11,6 +11,12 @@
 
 #include <cstdio>
 
+#ifndef HAVE_STRUCT_DIRENT_D_TYPE
+#define DT_UNKNOWN 0
+#define DT_REG 1
+#define DT_LNK 2
+#define DT_DIR 3
+#endif
 
 namespace nix {
 
@@ -150,8 +156,8 @@ void printMsg_(Verbosity level, const FormatOrString & fs);
 
 #define printMsg(level, f) \
     do { \
-        if (level <= verbosity) { \
-            printMsg_(level, (f)); \
+        if (level <= nix::verbosity) { \
+            nix::printMsg_(level, (f)); \
         } \
     } while (0)
 
@@ -199,9 +205,12 @@ class AutoDelete
     bool del;
     bool recursive;
 public:
+    AutoDelete();
     AutoDelete(const Path & p, bool recursive = true);
     ~AutoDelete();
     void cancel();
+    void reset(const Path & p, bool recursive = true);
+    operator Path() const { return path; }
 };
 
 
@@ -353,13 +362,6 @@ template<class N> bool string2Int(const string & s, N & n)
     std::istringstream str(s);
     str >> n;
     return str && str.get() == EOF;
-}
-
-template<class N> string int2String(N n)
-{
-    std::ostringstream str;
-    str << n;
-    return str.str();
 }
 
 

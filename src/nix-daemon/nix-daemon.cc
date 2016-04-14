@@ -319,8 +319,17 @@ static void performOp(bool trusted, unsigned int clientVersion,
 
     case wopBuildPaths: {
         PathSet drvs = readStorePaths<PathSet>(from);
+        BuildMode mode = bmNormal;
+        if (GET_PROTOCOL_MINOR(clientVersion) >= 15) {
+            mode = (BuildMode)readInt(from);
+
+	    /* Repairing is not atomic, so disallowed for "untrusted"
+	       clients.  */
+            if (mode == bmRepair && !trusted)
+                throw Error("repairing is not supported when building through the Nix daemon");
+        }
         startWork();
-        store->buildPaths(drvs);
+        store->buildPaths(drvs, mode);
         stopWork();
         to << 1;
         break;
@@ -416,8 +425,8 @@ static void performOp(bool trusted, unsigned int clientVersion,
         settings.keepGoing = readInt(from) != 0;
         settings.set("build-fallback", readInt(from) ? "true" : "false");
         verbosity = (Verbosity) readInt(from);
-        settings.set("build-max-jobs", int2String(readInt(from)));
-        settings.set("build-max-silent-time", int2String(readInt(from)));
+        settings.set("build-max-jobs", std::to_string(readInt(from)));
+        settings.set("build-max-silent-time", std::to_string(readInt(from)));
         if (GET_PROTOCOL_MINOR(clientVersion) >= 2)
             settings.useBuildHook = readInt(from) != 0;
         if (GET_PROTOCOL_MINOR(clientVersion) >= 4) {
@@ -426,7 +435,7 @@ static void performOp(bool trusted, unsigned int clientVersion,
             settings.printBuildTrace = readInt(from) != 0;
         }
         if (GET_PROTOCOL_MINOR(clientVersion) >= 6)
-            settings.set("build-cores", int2String(readInt(from)));
+            settings.set("build-cores", std::to_string(readInt(from)));
         if (GET_PROTOCOL_MINOR(clientVersion) >= 10)
             settings.set("build-use-substitutes", readInt(from) ? "true" : "false");
         if (GET_PROTOCOL_MINOR(clientVersion) >= 12) {
@@ -692,6 +701,10 @@ static PeerInfo getPeerInfo(int remote)
 
 #elif defined(LOCAL_PEERCRED)
 
+#if !defined(SOL_LOCAL)
+#define SOL_LOCAL 0
+#endif
+
     xucred cred;
     socklen_t credLen = sizeof(cred);
     if (getsockopt(remote, SOL_LOCAL, LOCAL_PEERCRED, &cred, &credLen) == -1)
@@ -720,7 +733,7 @@ static void daemonLoop(char * * argv)
 
     /* Handle socket-based activation by systemd. */
     if (getEnv("LISTEN_FDS") != "") {
-        if (getEnv("LISTEN_PID") != int2String(getpid()) || getEnv("LISTEN_FDS") != "1")
+        if (getEnv("LISTEN_PID") != std::to_string(getpid()) || getEnv("LISTEN_FDS") != "1")
             throw Error("unexpected systemd environment variables");
         fdSocket = SD_LISTEN_FDS_START;
     }
@@ -796,10 +809,10 @@ static void daemonLoop(char * * argv)
             PeerInfo peer = getPeerInfo(remote);
 
             struct passwd * pw = peer.uidKnown ? getpwuid(peer.uid) : 0;
-            string user = pw ? pw->pw_name : int2String(peer.uid);
+            string user = pw ? pw->pw_name : std::to_string(peer.uid);
 
             struct group * gr = peer.gidKnown ? getgrgid(peer.gid) : 0;
-            string group = gr ? gr->gr_name : int2String(peer.gid);
+            string group = gr ? gr->gr_name : std::to_string(peer.gid);
 
             Strings trustedUsers = settings.get("trusted-users", Strings({"root"}));
             Strings allowedUsers = settings.get("allowed-users", Strings({"*"}));
@@ -811,7 +824,7 @@ static void daemonLoop(char * * argv)
                 throw Error(format("user ‘%1%’ is not allowed to connect to the Nix daemon") % user);
 
             printMsg(lvlInfo, format((string) "accepted connection from pid %1%, user %2%" + (trusted ? " (trusted)" : ""))
-                % (peer.pidKnown ? int2String(peer.pid) : "<unknown>")
+                % (peer.pidKnown ? std::to_string(peer.pid) : "<unknown>")
                 % (peer.uidKnown ? user : "<unknown>"));
 
             /* Fork a child to handle the connection. */
@@ -832,7 +845,7 @@ static void daemonLoop(char * * argv)
 
                 /* For debugging, stuff the pid into argv[1]. */
                 if (peer.pidKnown && argv[1]) {
-                    string processName = int2String(peer.pid);
+                    string processName = std::to_string(peer.pid);
                     strncpy(argv[1], processName.c_str(), strlen(argv[1]));
                 }
 

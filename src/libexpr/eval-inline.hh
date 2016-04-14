@@ -78,5 +78,4 @@ inline void EvalState::forceList(Value & v, const Pos & pos)
         throwTypeError("value is %1% while a list was expected, at %2%", v, pos);
 }
 
-
 }

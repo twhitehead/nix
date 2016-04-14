@@ -23,8 +23,8 @@ let
         inherit officialRelease;
 
         buildInputs =
-          [ curl bison flex perl libxml2 libxslt bzip2
-            tetex dblatex nukeReferences pkgconfig sqlite libsodium
+          [ curl bison flex perl libxml2 libxslt bzip2 xz
+            dblatex (dblatex.tex or tetex) nukeReferences pkgconfig sqlite libsodium
             docbook5 docbook5_xsl
           ] ++ lib.optional (!lib.inNixShell) git;
 
@@ -36,7 +36,9 @@ let
 
         postUnpack = ''
           # Clean up when building from a working tree.
-          (cd $sourceRoot && (git ls-files -o | xargs -r rm -v))
+          if [[ -d $sourceRoot/.git ]]; then
+            git -C $sourceRoot clean -fd
+          fi
         '';
 
         preConfigure = ''
@@ -74,14 +76,15 @@ let
 
     build = pkgs.lib.genAttrs systems (system:
 
-      with import <nixpkgs> { inherit system; };
+      # FIXME: temporarily use a different branch for the Darwin build.
+      with import (if system == "x86_64-darwin" then <nixpkgs-darwin> else <nixpkgs>) { inherit system; };
 
       releaseTools.nixBuild {
         name = "nix";
         src = tarball;
 
         buildInputs =
-          [ curl perl bzip2 openssl pkgconfig sqlite boehmgc ]
+          [ curl perl bzip2 xz openssl pkgconfig sqlite boehmgc ]
           ++ lib.optional stdenv.isLinux libsodium;
 
         configureFlags = ''
@@ -108,7 +111,8 @@ let
 
     binaryTarball = pkgs.lib.genAttrs systems (system:
 
-      with import <nixpkgs> { inherit system; };
+      # FIXME: temporarily use a different branch for the Darwin build.
+      with import (if system == "x86_64-darwin" then <nixpkgs-darwin> else <nixpkgs>) { inherit system; };
 
       let
         toplevel = builtins.getAttr system jobs.build;
@@ -150,7 +154,7 @@ let
         src = tarball;
 
         buildInputs =
-          [ curl perl bzip2 openssl pkgconfig sqlite
+          [ curl perl bzip2 openssl pkgconfig sqlite xz libsodium
             # These are for "make check" only:
             graphviz libxml2 libxslt
           ];
@@ -279,7 +283,7 @@ let
       src = jobs.tarball;
       diskImage = (diskImageFun vmTools.diskImageFuns)
         { extraPackages =
-            [ "perl-DBD-SQLite" "perl-devel" "sqlite" "sqlite-devel" "bzip2-devel" "emacs" "perl-WWW-Curl" "libcurl-devel" ]
+            [ "perl-DBD-SQLite" "perl-devel" "sqlite" "sqlite-devel" "bzip2-devel" "emacs" "perl-WWW-Curl" "libcurl-devel" "openssl-devel" "xz-devel" ]
             ++ extraPackages; };
       memSize = 1024;
       meta.schedulingPriority = 50;
@@ -300,13 +304,13 @@ let
       src = jobs.tarball;
       diskImage = (diskImageFun vmTools.diskImageFuns)
         { extraPackages =
-            [ "libdbd-sqlite3-perl" "libsqlite3-dev" "libbz2-dev" "libwww-curl-perl" "libcurl-dev" ]
+            [ "libdbd-sqlite3-perl" "libsqlite3-dev" "libbz2-dev" "libwww-curl-perl" "libcurl-dev" "libcurl3-nss" "libssl-dev" "liblzma-dev" ]
             ++ extraPackages; };
       memSize = 1024;
       meta.schedulingPriority = 50;
       configureFlags = "--sysconfdir=/etc";
       debRequires =
-        [ "curl" "libdbd-sqlite3-perl" "libsqlite3-0" "libbz2-1.0" "bzip2" "xz-utils" "libwww-curl-perl" ]
+        [ "curl" "libdbd-sqlite3-perl" "libsqlite3-0" "libbz2-1.0" "bzip2" "xz-utils" "libwww-curl-perl" "libssl1.0.0" "liblzma5" ]
         ++ lib.optionals (lib.elem "libsodium-dev" extraPackages) [ "libsodium13" ] ;
       debMaintainer = "Eelco Dolstra <eelco.dolstra@logicblox.com>";
       doInstallCheck = true;

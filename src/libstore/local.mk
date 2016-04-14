@@ -8,7 +8,7 @@ libstore_SOURCES := $(wildcard $(d)/*.cc)
 
 libstore_LIBS = libutil libformat
 
-libstore_LDFLAGS = -lsqlite3 -lbz2 -lcurl
+libstore_LDFLAGS = $(SQLITE3_LIBS) -lbz2 $(LIBCURL_LIBS)
 
 ifeq ($(OS), SunOS)
 	libstore_LDFLAGS += -lsocket
@@ -33,3 +33,4 @@ $(d)/local-store.cc: $(d)/schema.sql.hh
 clean-files += $(d)/schema.sql.hh
 
 $(eval $(call install-file-in, $(d)/nix-store.pc, $(prefix)/lib/pkgconfig, 0644))
+$(eval $(call install-file-in, $(d)/sandbox-defaults.sb, $(datadir)/nix, 0644))

@@ -69,7 +69,7 @@ public:
 
     const Symbol sWith, sOutPath, sDrvPath, sType, sMeta, sName, sValue,
         sSystem, sOverrides, sOutputs, sOutputName, sIgnoreNulls,
-        sFile, sLine, sColumn, sFunctor;
+        sFile, sLine, sColumn, sFunctor, sToString;
     Symbol sDerivationNix;
 
     /* If set, force copying files to the Nix store even if they
@@ -212,6 +212,8 @@ public:
     /* Do a deep equality test between two values.  That is, list
        elements and attributes are compared recursively. */
     bool eqValues(Value & v1, Value & v2);
+
+    bool isFunctor(Value & fun);
 
     void callFunction(Value & fun, Value & arg, Value & v, const Pos & pos);
     void callPrimOp(Value & fun, Value & arg, Value & v, const Pos & pos);
