@@ -1,15 +1,18 @@
 #pragma once
 
 #include "types.hh"
+#include "logging.hh"
 
 #include <sys/types.h>
 #include <sys/stat.h>
 #include <dirent.h>
 #include <unistd.h>
 #include <signal.h>
-#include <functional>
 
+#include <functional>
+#include <limits>
 #include <cstdio>
+#include <map>
 
 #ifndef HAVE_STRUCT_DIRENT_D_TYPE
 #define DT_UNKNOWN 0
@@ -23,6 +26,9 @@ namespace nix {
 
 /* Return an environment variable. */
 string getEnv(const string & key, const string & def = "");
+
+/* Get the entire environment. */
+std::map<std::string, std::string> getEnv();
 
 /* Return an absolutized path, resolving paths relative to the
    specified directory, or the current directory otherwise.  The path
@@ -92,8 +98,8 @@ string readLine(int fd);
 void writeLine(int fd, string s);
 
 /* Delete a path; i.e., in the case of a directory, it is deleted
-   recursively.  Don't use this at home, kids.  The second variant
-   returns the number of bytes and blocks freed. */
+   recursively. It's not an error if the path does not exist. The
+   second variant returns the number of bytes and blocks freed. */
 void deletePath(const Path & path);
 
 void deletePath(const Path & path, unsigned long long & bytesFreed);
@@ -101,6 +107,9 @@ void deletePath(const Path & path, unsigned long long & bytesFreed);
 /* Create a temporary directory. */
 Path createTempDir(const Path & tmpRoot = "", const Path & prefix = "nix",
     bool includePid = true, bool useGlobalCounter = true, mode_t mode = 0755);
+
+/* Return the path to $XDG_CACHE_HOME/.cache. */
+Path getCacheDir();
 
 /* Create a directory and all its parents, if necessary.  Returns the
    list of created directories, in order of creation. */
@@ -113,68 +122,11 @@ void createSymlink(const Path & target, const Path & link);
 void replaceSymlink(const Path & target, const Path & link);
 
 
-template<class T, class A>
-T singleton(const A & a)
-{
-    T t;
-    t.insert(a);
-    return t;
-}
-
-
-/* Messages. */
-
-
-typedef enum {
-    ltPretty,   /* nice, nested output */
-    ltEscapes,  /* nesting indicated using escape codes (for log2xml) */
-    ltFlat,     /* no nesting */
-    ltSystemd,  /* use systemd severity prefixes */
-} LogType;
-
-extern LogType logType;
-extern Verbosity verbosity; /* suppress msgs > this */
-
-class Nest
-{
-private:
-    bool nest;
-public:
-    Nest();
-    ~Nest();
-    void open(Verbosity level, const FormatOrString & fs);
-    void close();
-};
-
-void printMsg_(Verbosity level, const FormatOrString & fs);
-
-#define startNest(varName, level, f) \
-    Nest varName; \
-    if (level <= verbosity) { \
-      varName.open(level, (f)); \
-    }
-
-#define printMsg(level, f) \
-    do { \
-        if (level <= nix::verbosity) { \
-            nix::printMsg_(level, (f)); \
-        } \
-    } while (0)
-
-#define debug(f) printMsg(lvlDebug, f)
-
-void warnOnce(bool & haveWarned, const FormatOrString & fs);
-
-void writeToStderr(const string & s);
-
-extern void (*_writeToStderr) (const unsigned char * buf, size_t count);
-
-
 /* Wrappers arount read()/write() that read/write exactly the
    requested number of bytes. */
 void readFull(int fd, unsigned char * buf, size_t count);
-void writeFull(int fd, const unsigned char * buf, size_t count);
-void writeFull(int fd, const string & s);
+void writeFull(int fd, const unsigned char * buf, size_t count, bool allowInterrupts = true);
+void writeFull(int fd, const string & s, bool allowInterrupts = true);
 
 MakeError(EndOfFile, Error)
 
@@ -217,16 +169,18 @@ public:
 class AutoCloseFD
 {
     int fd;
+    void close();
 public:
     AutoCloseFD();
     AutoCloseFD(int fd);
-    AutoCloseFD(const AutoCloseFD & fd);
+    AutoCloseFD(const AutoCloseFD & fd) = delete;
+    AutoCloseFD(AutoCloseFD&& fd);
     ~AutoCloseFD();
-    void operator =(int fd);
-    operator int() const;
-    void close();
-    bool isOpen();
-    int borrow();
+    AutoCloseFD& operator =(const AutoCloseFD & fd) = delete;
+    AutoCloseFD& operator =(AutoCloseFD&& fd);
+    int get() const;
+    explicit operator bool() const;
+    int release();
 };
 
 
@@ -293,7 +247,16 @@ pid_t startProcess(std::function<void()> fun, const ProcessOptions & options = P
 string runProgram(Path program, bool searchPath = false,
     const Strings & args = Strings(), const string & input = "");
 
-MakeError(ExecError, Error)
+class ExecError : public Error
+{
+public:
+    int status;
+
+    template<typename... Args>
+    ExecError(int status, Args... args)
+        : Error(args...), status(status)
+    { }
+};
 
 /* Convert a list of strings to a null-terminated vector of char
    *'s. The result must not be accessed beyond the lifetime of the
@@ -315,6 +278,8 @@ void restoreSIGPIPE();
 /* User interruption. */
 
 extern volatile sig_atomic_t _isInterrupted;
+
+extern thread_local bool interruptThrown;
 
 void _interrupted();
 
@@ -359,28 +324,32 @@ bool statusOk(int status);
 /* Parse a string into an integer. */
 template<class N> bool string2Int(const string & s, N & n)
 {
+    if (string(s, 0, 1) == "-" && !std::numeric_limits<N>::is_signed)
+        return false;
+    std::istringstream str(s);
+    str >> n;
+    return str && str.get() == EOF;
+}
+
+/* Parse a string into a float. */
+template<class N> bool string2Float(const string & s, N & n)
+{
     std::istringstream str(s);
     str >> n;
     return str && str.get() == EOF;
 }
 
 
+/* Return true iff `s' starts with `prefix'. */
+bool hasPrefix(const string & s, const string & prefix);
+
+
 /* Return true iff `s' ends in `suffix'. */
 bool hasSuffix(const string & s, const string & suffix);
 
 
-/* Read string `s' from stream `str'. */
-void expect(std::istream & str, const string & s);
-
-MakeError(FormatError, Error)
-
-
-/* Read a C-style string from stream `str'. */
-string parseString(std::istream & str);
-
-
-/* Utility function used to parse legacy ATerms. */
-bool endOfList(std::istream & str);
+/* Convert a string to lower case. */
+std::string toLower(const std::string & s);
 
 
 /* Escape a string that contains octal-encoded escape codes such as
@@ -409,6 +378,56 @@ string filterANSIEscapes(const string & s, bool nixOnly = false);
 /* Base64 encoding/decoding. */
 string base64Encode(const string & s);
 string base64Decode(const string & s);
+
+
+/* Get a value for the specified key from an associate container, or a
+   default value if the key doesn't exist. */
+template <class T>
+string get(const T & map, const string & key, const string & def = "")
+{
+    auto i = map.find(key);
+    return i == map.end() ? def : i->second;
+}
+
+
+/* Call ‘failure’ with the current exception as argument. If ‘failure’
+   throws an exception, abort the program. */
+void callFailure(const std::function<void(std::exception_ptr exc)> & failure,
+    std::exception_ptr exc = std::current_exception());
+
+
+/* Evaluate the function ‘f’. If it returns a value, call ‘success’
+   with that value as its argument. If it or ‘success’ throws an
+   exception, call ‘failure’. If ‘failure’ throws an exception, abort
+   the program. */
+template<class T>
+void sync2async(
+    const std::function<void(T)> & success,
+    const std::function<void(std::exception_ptr exc)> & failure,
+    const std::function<T()> & f)
+{
+    try {
+        success(f());
+    } catch (...) {
+        callFailure(failure);
+    }
+}
+
+
+/* Call the function ‘success’. If it throws an exception, call
+   ‘failure’. If that throws an exception, abort the program. */
+template<class T>
+void callSuccess(
+    const std::function<void(T)> & success,
+    const std::function<void(std::exception_ptr exc)> & failure,
+    T && arg)
+{
+    try {
+        success(arg);
+    } catch (...) {
+        callFailure(failure);
+    }
+}
 
 
 }

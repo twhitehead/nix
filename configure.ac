@@ -1,5 +1,5 @@
 AC_INIT(nix, m4_esyscmd([bash -c "echo -n $(cat ./version)$VERSION_SUFFIX"]))
-AC_CONFIG_SRCDIR(README)
+AC_CONFIG_SRCDIR(README.md)
 AC_CONFIG_AUX_DIR(config)
 
 AC_PROG_SED
@@ -16,12 +16,14 @@ AC_ARG_WITH(system, AC_HELP_STRING([--with-system=SYSTEM],
         machine_name="i686";;
      amd64)
         machine_name="x86_64";;
+     armv6|armv7)
+        machine_name="${host_cpu}l";;
      *)
         machine_name="$host_cpu";;
    esac
 
    case "$host_os" in
-     linux-gnu*)
+     linux-gnu*|linux-musl*)
         # For backward compatibility, strip the `-gnu' part.
         system="$machine_name-linux";;
      *)
@@ -59,6 +61,7 @@ CFLAGS=
 CXXFLAGS=
 AC_PROG_CC
 AC_PROG_CXX
+AX_CXX_COMPILE_STDCXX_11
 
 
 # Use 64-bit file system calls so that we can support files > 2 GiB.
@@ -77,7 +80,7 @@ static char buf[1024];]],
 AC_LANG_POP(C++)
 
 
-AC_CHECK_FUNCS([statvfs])
+AC_CHECK_FUNCS([statvfs pipe2])
 
 
 # Check for lutimes, optionally used for changing the mtime of
@@ -101,11 +104,6 @@ rm -f tmp_link tmp_link2
 AC_LANG_PUSH(C++)
 AC_CHECK_HEADERS([locale])
 AC_LANG_POP(C++)
-
-
-# Check for <err.h>.
-AC_CHECK_HEADER([err.h], [], [bsddiff_compat_include="-Icompat-include"])
-AC_SUBST([bsddiff_compat_include])
 
 
 AC_DEFUN([NEED_PROG],
@@ -166,10 +164,6 @@ AC_SUBST(storedir)
 
 
 # Look for OpenSSL, a required dependency.
-AC_PATH_PROG(openssl, openssl, openssl) # if not found, call openssl in $PATH
-AC_SUBST(openssl)
-AC_DEFINE_UNQUOTED(OPENSSL_PATH, ["$openssl"], [Path of the OpenSSL binary])
-
 PKG_CHECK_MODULES([OPENSSL], [libcrypto], [CXXFLAGS="$OPENSSL_CFLAGS $CXXFLAGS"])
 
 
@@ -198,6 +192,15 @@ AC_SUBST(HAVE_SODIUM, [$have_sodium])
 
 # Look for liblzma, a required dependency.
 PKG_CHECK_MODULES([LIBLZMA], [liblzma], [CXXFLAGS="$LIBLZMA_CFLAGS $CXXFLAGS"])
+
+
+# Look for aws-cpp-sdk-s3.
+AC_LANG_PUSH(C++)
+AC_CHECK_HEADERS([aws/s3/S3Client.h],
+  [AC_DEFINE([ENABLE_S3], [1], [Whether to enable S3 support via aws-cpp-sdk-s3.])
+  enable_s3=1], [enable_s3=])
+AC_SUBST(ENABLE_S3, [$enable_s3])
+AC_LANG_POP(C++)
 
 
 # Whether to use the Boehm garbage collector.
@@ -243,23 +246,6 @@ AC_MSG_RESULT(yes)
 AC_SUBST(perlFlags)
 
 
-# Check for otool, an optional dependency on Darwin.
-AC_PATH_PROG(otool, otool)
-AC_MSG_CHECKING([that otool works])
-case $host_os in
-  darwin*)
-    if test -z "$otool" || ! $otool --version 2>/dev/null; then
-      AC_MSG_RESULT(no)
-      AC_MSG_ERROR([Can't get version from otool; do you need to install developer tools?])
-    fi
-    AC_MSG_RESULT(yes)
-    ;;
-  *)
-    AC_MSG_RESULT(not needed)
-    ;;
-esac
-
-
 # Whether to build the Perl bindings
 AC_MSG_CHECKING([whether to build the Perl bindings])
 AC_ARG_ENABLE(perl-bindings, AC_HELP_STRING([--enable-perl-bindings],
@@ -277,6 +263,13 @@ AC_ARG_ENABLE(init-state, AC_HELP_STRING([--disable-init-state],
   [do not initialise DB etc. in `make install']),
   init_state=$enableval, init_state=yes)
 #AM_CONDITIONAL(INIT_STATE, test "$init_state" = "yes")
+
+
+# documentation generation switch
+AC_ARG_ENABLE(doc-gen, AC_HELP_STRING([--disable-doc-gen],
+  [disable documentation generation]),
+  doc_generate=$enableval, doc_generate=yes)
+AC_SUBST(doc_generate)
 
 
 # Setuid installations.

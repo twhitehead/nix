@@ -1,4 +1,5 @@
 { nix ? { outPath = ./.; revCount = 1234; shortRev = "abcdef"; }
+, nixpkgs ? { outPath = <nixpkgs>; revCount = 1234; shortRev = "abcdef"; }
 , officialRelease ? false
 }:
 
@@ -24,8 +25,9 @@ let
 
         buildInputs =
           [ curl bison flex perl libxml2 libxslt bzip2 xz
-            dblatex (dblatex.tex or tetex) nukeReferences pkgconfig sqlite libsodium
+            pkgconfig sqlite libsodium
             docbook5 docbook5_xsl
+            autoconf-archive
           ] ++ lib.optional (!lib.inNixShell) git;
 
         configureFlags = ''
@@ -56,28 +58,14 @@ let
 
         preDist = ''
           make install docdir=$out/share/doc/nix makefiles=doc/manual/local.mk
-
-          make doc/manual/manual.pdf
-          cp doc/manual/manual.pdf $out/manual.pdf
-
-          # The PDF containes filenames of included graphics (see
-          # http://www.tug.org/pipermail/pdftex/2007-August/007290.html).
-          # This causes a retained dependency on dblatex, which Hydra
-          # doesn't like (the output of the tarball job is distributed
-          # to Windows and Macs, so there should be no Linux binaries
-          # in the closure).
-          nuke-refs $out/manual.pdf
-
           echo "doc manual $out/share/doc/nix/manual" >> $out/nix-support/hydra-build-products
-          echo "doc-pdf manual $out/manual.pdf" >> $out/nix-support/hydra-build-products
         '';
       };
 
 
     build = pkgs.lib.genAttrs systems (system:
 
-      # FIXME: temporarily use a different branch for the Darwin build.
-      with import (if system == "x86_64-darwin" then <nixpkgs-darwin> else <nixpkgs>) { inherit system; };
+      with import <nixpkgs> { inherit system; };
 
       releaseTools.nixBuild {
         name = "nix";
@@ -85,7 +73,12 @@ let
 
         buildInputs =
           [ curl perl bzip2 xz openssl pkgconfig sqlite boehmgc ]
-          ++ lib.optional stdenv.isLinux libsodium;
+          ++ lib.optional stdenv.isLinux libsodium
+          ++ lib.optional stdenv.isLinux
+            (aws-sdk-cpp.override {
+              apis = ["s3"];
+              customMemoryManagement = false;
+            });
 
         configureFlags = ''
           --disable-init-state
@@ -112,7 +105,7 @@ let
     binaryTarball = pkgs.lib.genAttrs systems (system:
 
       # FIXME: temporarily use a different branch for the Darwin build.
-      with import (if system == "x86_64-darwin" then <nixpkgs-darwin> else <nixpkgs>) { inherit system; };
+      with import <nixpkgs> { inherit system; };
 
       let
         toplevel = builtins.getAttr system jobs.build;
@@ -179,33 +172,21 @@ let
       };
 
 
-    rpm_fedora18i386 = makeRPM_i686 (diskImageFuns: diskImageFuns.fedora18i386) [];
-    rpm_fedora18x86_64 = makeRPM_x86_64 (diskImageFunsFun: diskImageFunsFun.fedora18x86_64) [];
-    rpm_fedora19i386 = makeRPM_i686 (diskImageFuns: diskImageFuns.fedora19i386) [];
-    rpm_fedora19x86_64 = makeRPM_x86_64 (diskImageFunsFun: diskImageFunsFun.fedora19x86_64) [];
-    rpm_fedora20i386 = makeRPM_i686 (diskImageFuns: diskImageFuns.fedora20i386) [];
-    rpm_fedora20x86_64 = makeRPM_x86_64 (diskImageFunsFun: diskImageFunsFun.fedora20x86_64) [];
     rpm_fedora21i386 = makeRPM_i686 (diskImageFuns: diskImageFuns.fedora21i386) [ "libsodium-devel" ];
     rpm_fedora21x86_64 = makeRPM_x86_64 (diskImageFunsFun: diskImageFunsFun.fedora21x86_64) [ "libsodium-devel" ];
 
 
-    deb_debian7i386 = makeDeb_i686 (diskImageFuns: diskImageFuns.debian7i386) [];
-    deb_debian7x86_64 = makeDeb_x86_64 (diskImageFunsFun: diskImageFunsFun.debian7x86_64) [];
-    deb_debian8i386 = makeDeb_i686 (diskImageFuns: diskImageFuns.debian8i386) [ "libsodium-dev" ];
-    deb_debian8x86_64 = makeDeb_x86_64 (diskImageFunsFun: diskImageFunsFun.debian8x86_64) [ "libsodium-dev" ];
+    deb_debian8i386 = makeDeb_i686 (diskImageFuns: diskImageFuns.debian8i386) [ "libsodium-dev" ] [ "libsodium13" ];
+    deb_debian8x86_64 = makeDeb_x86_64 (diskImageFunsFun: diskImageFunsFun.debian8x86_64) [ "libsodium-dev" ] [ "libsodium13" ];
 
-    deb_ubuntu1210i386 = makeDeb_i686 (diskImageFuns: diskImageFuns.ubuntu1210i386) [];
-    deb_ubuntu1210x86_64 = makeDeb_x86_64 (diskImageFuns: diskImageFuns.ubuntu1210x86_64) [];
-    deb_ubuntu1304i386 = makeDeb_i686 (diskImageFuns: diskImageFuns.ubuntu1304i386) [];
-    deb_ubuntu1304x86_64 = makeDeb_x86_64 (diskImageFuns: diskImageFuns.ubuntu1304x86_64) [];
-    deb_ubuntu1310i386 = makeDeb_i686 (diskImageFuns: diskImageFuns.ubuntu1310i386) [];
-    deb_ubuntu1310x86_64 = makeDeb_x86_64 (diskImageFuns: diskImageFuns.ubuntu1310x86_64) [];
-    deb_ubuntu1404i386 = makeDeb_i686 (diskImageFuns: diskImageFuns.ubuntu1404i386) [];
-    deb_ubuntu1404x86_64 = makeDeb_x86_64 (diskImageFuns: diskImageFuns.ubuntu1404x86_64) [];
-    deb_ubuntu1410i386 = makeDeb_i686 (diskImageFuns: diskImageFuns.ubuntu1410i386) [];
-    deb_ubuntu1410x86_64 = makeDeb_x86_64 (diskImageFuns: diskImageFuns.ubuntu1410x86_64) [];
-    deb_ubuntu1504i386 = makeDeb_i686 (diskImageFuns: diskImageFuns.ubuntu1504i386) [ "libsodium-dev" ];
-    deb_ubuntu1504x86_64 = makeDeb_x86_64 (diskImageFuns: diskImageFuns.ubuntu1504x86_64) [ "libsodium-dev" ];
+    deb_ubuntu1410i386 = makeDeb_i686 (diskImageFuns: diskImageFuns.ubuntu1410i386) [] [];
+    deb_ubuntu1410x86_64 = makeDeb_x86_64 (diskImageFuns: diskImageFuns.ubuntu1410x86_64) [] [];
+    deb_ubuntu1504i386 = makeDeb_i686 (diskImageFuns: diskImageFuns.ubuntu1504i386) [ "libsodium-dev" ] [ "libsodium13" ];
+    deb_ubuntu1504x86_64 = makeDeb_x86_64 (diskImageFuns: diskImageFuns.ubuntu1504x86_64) [ "libsodium-dev" ] [ "libsodium13" ];
+    deb_ubuntu1510i386 = makeDeb_i686 (diskImageFuns: diskImageFuns.ubuntu1510i386) [ "libsodium-dev" ] [ "libsodium13"];
+    deb_ubuntu1510x86_64 = makeDeb_x86_64 (diskImageFuns: diskImageFuns.ubuntu1510x86_64) [ "libsodium-dev" ] [ "libsodium13" ];
+    deb_ubuntu1604i386 = makeDeb_i686 (diskImageFuns: diskImageFuns.ubuntu1604i386) [ "libsodium-dev" ] [ "libsodium18" ];
+    deb_ubuntu1604x86_64 = makeDeb_x86_64 (diskImageFuns: diskImageFuns.ubuntu1604x86_64) [ "libsodium-dev" ] [ "libsodium18" ];
 
 
     # System tests.
@@ -225,14 +206,35 @@ let
         ''
           useradd -m alice
           su - alice -c 'tar xf ${binaryTarball.x86_64-linux}/*.tar.*'
-          mount -t tmpfs none /nix # Provide a writable /nix.
+          mkdir /dest-nix
+          mount -o bind /dest-nix /nix # Provide a writable /nix.
           chown alice /nix
           su - alice -c '_NIX_INSTALLER_TEST=1 ./nix-*/install'
           su - alice -c 'nix-store --verify'
-          su - alice -c 'nix-store -qR ${build.x86_64-linux}'
+          su - alice -c 'PAGER= nix-store -qR ${build.x86_64-linux}'
           mkdir -p $out/nix-support
           touch $out/nix-support/hydra-build-products
+          umount /nix
         ''); # */
+
+    tests.evalNixpkgs =
+      import <nixpkgs/pkgs/top-level/make-tarball.nix> {
+        inherit nixpkgs;
+        inherit pkgs;
+        nix = build.x86_64-linux;
+        officialRelease = false;
+      };
+
+    tests.evalNixOS =
+      pkgs.runCommand "eval-nixos" { buildInputs = [ build.x86_64-linux ]; }
+        ''
+          export NIX_STATE_DIR=$TMPDIR
+          nix-store --init
+
+          nix-instantiate ${nixpkgs}/nixos/release-combined.nix -A tested --dry-run
+
+          touch $out
+        '';
 
 
     # Aggregate job containing the release-critical jobs.
@@ -251,19 +253,17 @@ let
           binaryTarball.x86_64-darwin
           #binaryTarball.x86_64-freebsd
           binaryTarball.x86_64-linux
-          deb_debian7i386
-          deb_debian7x86_64
-          deb_ubuntu1404i386 # LTS
-          deb_ubuntu1404x86_64 # LTS
+          deb_debian8i386
+          deb_debian8x86_64
           deb_ubuntu1504i386
           deb_ubuntu1504x86_64
-          rpm_fedora20i386
-          rpm_fedora20x86_64
           rpm_fedora21i386
           rpm_fedora21x86_64
           tests.remoteBuilds
           tests.nix-copy-closure
           tests.binaryTarball
+          tests.evalNixpkgs
+          tests.evalNixOS
         ];
     };
 
@@ -295,7 +295,7 @@ let
   makeDeb_x86_64 = makeDeb "x86_64-linux";
 
   makeDeb =
-    system: diskImageFun: extraPackages:
+    system: diskImageFun: extraPackages: extraDebPackages:
 
     with import <nixpkgs> { inherit system; };
 
@@ -308,10 +308,11 @@ let
             ++ extraPackages; };
       memSize = 1024;
       meta.schedulingPriority = 50;
+      postInstall = "make installcheck";
       configureFlags = "--sysconfdir=/etc";
       debRequires =
         [ "curl" "libdbd-sqlite3-perl" "libsqlite3-0" "libbz2-1.0" "bzip2" "xz-utils" "libwww-curl-perl" "libssl1.0.0" "liblzma5" ]
-        ++ lib.optionals (lib.elem "libsodium-dev" extraPackages) [ "libsodium13" ] ;
+        ++ extraDebPackages;
       debMaintainer = "Eelco Dolstra <eelco.dolstra@logicblox.com>";
       doInstallCheck = true;
     };

@@ -7,7 +7,10 @@
 namespace nix {
 
 
-typedef enum { htUnknown, htMD5, htSHA1, htSHA256, htSHA512 } HashType;
+MakeError(BadHash, Error);
+
+
+enum HashType : char { htUnknown, htMD5, htSHA1, htSHA256, htSHA512 };
 
 
 const int md5HashSize = 16;
@@ -26,11 +29,14 @@ struct Hash
 
     HashType type;
 
-    /* Create an unusable hash object. */
+    /* Create an unset hash object. */
     Hash();
 
     /* Create a zero-filled hash object. */
     Hash(HashType type);
+
+    /* Check whether a hash is set. */
+    operator bool () const { return type != htUnknown; }
 
     /* Check whether two hash are equal. */
     bool operator == (const Hash & h2) const;
@@ -40,17 +46,30 @@ struct Hash
 
     /* For sorting. */
     bool operator < (const Hash & h) const;
+
+    /* Returns the length of a base-16 representation of this hash. */
+    size_t base16Len() const
+    {
+        return hashSize * 2;
+    }
+
+    /* Returns the length of a base-32 representation of this hash. */
+    size_t base32Len() const
+    {
+        return (hashSize * 8 - 1) / 5 + 1;
+    }
+
+    std::string to_string(bool base32 = true) const;
 };
 
 
 /* Convert a hash to a hexadecimal representation. */
 string printHash(const Hash & hash);
 
+Hash parseHash(const string & s);
+
 /* Parse a hexadecimal representation of a hash code. */
 Hash parseHash(HashType ht, const string & s);
-
-/* Returns the length of a base-32 hash representation. */
-unsigned int hashLength32(const Hash & hash);
 
 /* Convert a hash to a base-32 representation. */
 string printHash32(const Hash & hash);

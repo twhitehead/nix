@@ -4,6 +4,8 @@
 
 namespace nix {
 
-void printDotGraph(const PathSet & roots);
+class Store;
+
+void printDotGraph(ref<Store> store, const PathSet & roots);
 
 }

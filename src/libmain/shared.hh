@@ -1,6 +1,7 @@
 #pragma once
 
 #include "util.hh"
+#include "args.hh"
 
 #include <signal.h>
 
@@ -9,8 +10,6 @@
 
 namespace nix {
 
-MakeError(UsageError, nix::Error);
-
 class Exit : public std::exception
 {
 public:
@@ -18,8 +17,6 @@ public:
     Exit() : status(0) { }
     Exit(int status) : status(status) { }
 };
-
-class StoreAPI;
 
 int handleExceptions(const string & programName, std::function<void()> fun);
 
@@ -33,9 +30,11 @@ void printVersion(const string & programName);
 /* Ugh.  No better place to put this. */
 void printGCWarning();
 
-void printMissing(StoreAPI & store, const PathSet & paths);
+class Store;
 
-void printMissing(const PathSet & willBuild,
+void printMissing(ref<Store> store, const PathSet & paths);
+
+void printMissing(ref<Store> store, const PathSet & willBuild,
     const PathSet & willSubstitute, const PathSet & unknown,
     unsigned long long downloadSize, unsigned long long narSize);
 
@@ -65,6 +64,7 @@ template<class N> N getIntArg(const string & opt,
         throw UsageError(format("‘%1%’ requires an integer argument") % opt);
     return n * multiplier;
 }
+
 
 /* Show the manual page for the specified program. */
 void showManPage(const string & name);
@@ -98,6 +98,10 @@ struct PrintFreed
         : show(show), results(results) { }
     ~PrintFreed();
 };
+
+
+/* Install a SIGSEGV handler to detect stack overflows. */
+void detectStackOverflow();
 
 
 }

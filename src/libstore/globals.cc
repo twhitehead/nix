@@ -28,7 +28,6 @@ Settings::Settings()
     keepFailed = false;
     keepGoing = false;
     tryFallback = false;
-    buildVerbosity = lvlError;
     maxBuildJobs = 1;
     buildCores = 1;
 #ifdef _SC_NPROCESSORS_ONLN
@@ -40,7 +39,6 @@ Settings::Settings()
     maxSilentTime = 0;
     buildTimeout = 0;
     useBuildHook = true;
-    printBuildTrace = false;
     reservedSize = 8 * 1024 * 1024;
     fsyncMetadata = true;
     useSQLiteWAL = true;
@@ -52,7 +50,6 @@ Settings::Settings()
     keepLog = true;
     compressLog = true;
     maxLogSize = 0;
-    cacheFailure = false;
     pollInterval = 5;
     checkRootReachability = false;
     gcKeepOutputs = false;
@@ -72,7 +69,6 @@ void Settings::processEnvironment()
     nixDataDir = canonPath(getEnv("NIX_DATA_DIR", NIX_DATA_DIR));
     nixLogDir = canonPath(getEnv("NIX_LOG_DIR", NIX_LOG_DIR));
     nixStateDir = canonPath(getEnv("NIX_STATE_DIR", NIX_STATE_DIR));
-    nixDBPath = getEnv("NIX_DB_DIR", nixStateDir + "/db");
     nixConfDir = canonPath(getEnv("NIX_CONF_DIR", NIX_CONF_DIR));
     nixLibexecDir = canonPath(getEnv("NIX_LIBEXEC_DIR", NIX_LIBEXEC_DIR));
     nixBinDir = canonPath(getEnv("NIX_BIN_DIR", NIX_BIN_DIR));
@@ -80,7 +76,7 @@ void Settings::processEnvironment()
 
     // should be set with the other config options, but depends on nixLibexecDir
 #ifdef __APPLE__
-    preBuildHook = nixLibexecDir + "/nix/resolve-system-dependencies.pl";
+    preBuildHook = nixLibexecDir + "/nix/resolve-system-dependencies";
 #endif
 }
 
@@ -175,7 +171,6 @@ void Settings::update()
     _get(keepLog, "build-keep-log");
     _get(compressLog, "build-compress-log");
     _get(maxLogSize, "build-max-log-size");
-    _get(cacheFailure, "build-cache-failure");
     _get(pollInterval, "build-poll-interval");
     _get(checkRootReachability, "gc-check-reachability");
     _get(gcKeepOutputs, "gc-keep-outputs");
@@ -188,20 +183,6 @@ void Settings::update()
     _get(enableImportNative, "allow-unsafe-native-code-during-evaluation");
     _get(useCaseHack, "use-case-hack");
     _get(preBuildHook, "pre-build-hook");
-
-    string subs = getEnv("NIX_SUBSTITUTERS", "default");
-    if (subs == "default") {
-        substituters.clear();
-#if 0
-        if (getEnv("NIX_OTHER_STORES") != "")
-            substituters.push_back(nixLibexecDir + "/nix/substituters/copy-from-other-stores.pl");
-#endif
-        substituters.push_back(nixLibexecDir + "/nix/substituters/download-using-manifests.pl");
-        substituters.push_back(nixLibexecDir + "/nix/substituters/download-from-binary-cache.pl");
-        if (useSshSubstituter && !sshSubstituterHosts.empty())
-            substituters.push_back(nixLibexecDir + "/nix/substituters/download-via-ssh");
-    } else
-        substituters = tokenizeString<Strings>(subs, ":");
 }
 
 

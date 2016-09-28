@@ -1,5 +1,7 @@
 #pragma once
 
+#include <memory>
+
 #include "types.hh"
 #include "util.hh"
 
@@ -12,6 +14,12 @@ struct Sink
 {
     virtual ~Sink() { }
     virtual void operator () (const unsigned char * data, size_t len) = 0;
+    virtual bool good() { return true; }
+
+    void operator () (const std::string & s)
+    {
+        (*this)((const unsigned char *) s.data(), s.size());
+    }
 };
 
 
@@ -19,13 +27,17 @@ struct Sink
 struct BufferedSink : Sink
 {
     size_t bufSize, bufPos;
-    unsigned char * buffer;
+    std::unique_ptr<unsigned char[]> buffer;
 
     BufferedSink(size_t bufSize = 32 * 1024)
-        : bufSize(bufSize), bufPos(0), buffer(0) { }
-    ~BufferedSink();
+        : bufSize(bufSize), bufPos(0), buffer(nullptr) { }
 
-    void operator () (const unsigned char * data, size_t len);
+    void operator () (const unsigned char * data, size_t len) override;
+
+    void operator () (const std::string & s)
+    {
+        Sink::operator()(s);
+    }
 
     void flush();
 
@@ -47,6 +59,8 @@ struct Source
        return the number of bytes stored.  If blocks until at least
        one byte is available. */
     virtual size_t read(unsigned char * data, size_t len) = 0;
+
+    virtual bool good() { return true; }
 };
 
 
@@ -54,13 +68,12 @@ struct Source
 struct BufferedSource : Source
 {
     size_t bufSize, bufPosIn, bufPosOut;
-    unsigned char * buffer;
+    std::unique_ptr<unsigned char[]> buffer;
 
     BufferedSource(size_t bufSize = 32 * 1024)
-        : bufSize(bufSize), bufPosIn(0), bufPosOut(0), buffer(0) { }
-    ~BufferedSource();
+        : bufSize(bufSize), bufPosIn(0), bufPosOut(0), buffer(nullptr) { }
 
-    size_t read(unsigned char * data, size_t len);
+    size_t read(unsigned char * data, size_t len) override;
 
     /* Underlying read call, to be overridden. */
     virtual size_t readUnbuffered(unsigned char * data, size_t len) = 0;
@@ -73,14 +86,21 @@ struct BufferedSource : Source
 struct FdSink : BufferedSink
 {
     int fd;
-    bool warn;
-    size_t written;
+    bool warn = false;
+    size_t written = 0;
 
-    FdSink() : fd(-1), warn(false), written(0) { }
-    FdSink(int fd) : fd(fd), warn(false), written(0) { }
+    FdSink() : fd(-1) { }
+    FdSink(int fd) : fd(fd) { }
+    FdSink(FdSink&&) = default;
+    FdSink& operator=(FdSink&&) = default;
     ~FdSink();
 
-    void write(const unsigned char * data, size_t len);
+    void write(const unsigned char * data, size_t len) override;
+
+    bool good() override;
+
+private:
+    bool _good = true;
 };
 
 
@@ -88,17 +108,24 @@ struct FdSink : BufferedSink
 struct FdSource : BufferedSource
 {
     int fd;
+    size_t read = 0;
+
     FdSource() : fd(-1) { }
     FdSource(int fd) : fd(fd) { }
-    size_t readUnbuffered(unsigned char * data, size_t len);
+    size_t readUnbuffered(unsigned char * data, size_t len) override;
+    bool good() override;
+private:
+    bool _good = true;
 };
 
 
 /* A sink that writes data to a string. */
 struct StringSink : Sink
 {
-    string s;
-    void operator () (const unsigned char * data, size_t len);
+    ref<std::string> s;
+    StringSink() : s(make_ref<std::string>()) { };
+    StringSink(ref<std::string> s) : s(s) { };
+    void operator () (const unsigned char * data, size_t len) override;
 };
 
 
@@ -108,7 +135,7 @@ struct StringSource : Source
     const string & s;
     size_t pos;
     StringSource(const string & _s) : s(_s), pos(0) { }
-    size_t read(unsigned char * data, size_t len);
+    size_t read(unsigned char * data, size_t len) override;
 };
 
 

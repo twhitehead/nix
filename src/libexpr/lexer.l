@@ -86,6 +86,7 @@ static Expr * unescapeStr(SymbolTable & symbols, const char * s)
 
 ID          [a-zA-Z\_][a-zA-Z0-9\_\'\-]*
 INT         [0-9]+
+FLOAT       (([1-9][0-9]*\.[0-9]*)|(0?\.[0-9]+))([Ee][+-]?[0-9]+)?
 PATH        [a-zA-Z0-9\.\_\-\+]*(\/[a-zA-Z0-9\.\_\-\+]+)+
 HPATH       \~(\/[a-zA-Z0-9\.\_\-\+]+)+
 SPATH       \<[a-zA-Z0-9\.\_\-\+]+(\/[a-zA-Z0-9\.\_\-\+]+)*\>
@@ -126,16 +127,22 @@ or          { return OR_KW; }
                   throw ParseError(format("invalid integer ‘%1%’") % yytext);
               return INT;
             }
+{FLOAT}     { errno = 0;
+              yylval->nf = strtod(yytext, 0);
+              if (errno != 0)
+                  throw ParseError(format("invalid float ‘%1%’") % yytext);
+              return FLOAT;
+            }
 
 \$\{        { PUSH_STATE(INSIDE_DOLLAR_CURLY); return DOLLAR_CURLY; }
-\{          { return '{'; }
 }
 
-\}                     { return '}'; }
+\}                           { return '}'; }
 <INSIDE_DOLLAR_CURLY>\}      { POP_STATE(); return '}'; }
+\{                           { return '{'; }
+<INSIDE_DOLLAR_CURLY>\{      { PUSH_STATE(INSIDE_DOLLAR_CURLY); return '{'; }
 
 <INITIAL,INSIDE_DOLLAR_CURLY>\"          { PUSH_STATE(STRING); return '"'; }
-
 <STRING>([^\$\"\\]|\$[^\{\"\\]|\\.|\$\\.)*\$/\" |
 <STRING>([^\$\"\\]|\$[^\{\"\\]|\\.|\$\\.)+ {
               /* It is impossible to match strings ending with '$' with one
@@ -187,6 +194,8 @@ or          { return OR_KW; }
 .           return yytext[0];
 
 }
+
+<<EOF>> { data->atEnd = true; return 0; }
 
 %%
 

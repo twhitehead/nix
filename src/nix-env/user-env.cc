@@ -38,7 +38,7 @@ bool createUserEnv(EvalState & state, DrvInfos & elems,
             drvsToBuild.insert(i.queryDrvPath());
 
     debug(format("building user environment dependencies"));
-    store->buildPaths(drvsToBuild, state.repair ? bmRepair : bmNormal);
+    state.store->buildPaths(drvsToBuild, state.repair ? bmRepair : bmNormal);
 
     /* Construct the whole top level derivation. */
     PathSet references;
@@ -63,8 +63,8 @@ bool createUserEnv(EvalState & state, DrvInfos & elems,
         if (drvPath != "")
             mkString(*state.allocAttr(v, state.sDrvPath), i.queryDrvPath());
 
-        // Copy each output.
-        DrvInfo::Outputs outputs = i.queryOutputs();
+        // Copy each output meant for installation.
+        DrvInfo::Outputs outputs = i.queryOutputs(true);
         Value & vOutputs = *state.allocAttr(v, state.sOutputs);
         state.mkList(vOutputs, outputs.size());
         unsigned int m = 0;
@@ -76,8 +76,8 @@ bool createUserEnv(EvalState & state, DrvInfos & elems,
 
             /* This is only necessary when installing store paths, e.g.,
                `nix-env -i /nix/store/abcd...-foo'. */
-            store->addTempRoot(j.second);
-            store->ensurePath(j.second);
+            state.store->addTempRoot(j.second);
+            state.store->ensurePath(j.second);
 
             references.insert(j.second);
         }
@@ -100,7 +100,7 @@ bool createUserEnv(EvalState & state, DrvInfos & elems,
     /* Also write a copy of the list of user environment elements to
        the store; we need it for future modifications of the
        environment. */
-    Path manifestFile = store->addTextToStore("env-manifest.nix",
+    Path manifestFile = state.store->addTextToStore("env-manifest.nix",
         (format("%1%") % manifest).str(), references);
 
     /* Get the environment builder expression. */
@@ -112,7 +112,7 @@ bool createUserEnv(EvalState & state, DrvInfos & elems,
     Value args, topLevel;
     state.mkAttrs(args, 3);
     mkString(*state.allocAttr(args, state.symbols.create("manifest")),
-        manifestFile, singleton<PathSet>(manifestFile));
+        manifestFile, {manifestFile});
     args.attrs->push_back(Attr(state.symbols.create("derivations"), &manifest));
     args.attrs->sort();
     mkApp(topLevel, envBuilder, args);
@@ -128,21 +128,25 @@ bool createUserEnv(EvalState & state, DrvInfos & elems,
 
     /* Realise the resulting store expression. */
     debug("building user environment");
-    store->buildPaths(singleton<PathSet>(topLevelDrv), state.repair ? bmRepair : bmNormal);
+    state.store->buildPaths({topLevelDrv}, state.repair ? bmRepair : bmNormal);
 
     /* Switch the current user environment to the output path. */
-    PathLocks lock;
-    lockProfile(lock, profile);
+    auto store2 = state.store.dynamic_pointer_cast<LocalFSStore>();
 
-    Path lockTokenCur = optimisticLockProfile(profile);
-    if (lockToken != lockTokenCur) {
-        printMsg(lvlError, format("profile ‘%1%’ changed while we were busy; restarting") % profile);
-        return false;
+    if (store2) {
+        PathLocks lock;
+        lockProfile(lock, profile);
+
+        Path lockTokenCur = optimisticLockProfile(profile);
+        if (lockToken != lockTokenCur) {
+            printError(format("profile ‘%1%’ changed while we were busy; restarting") % profile);
+            return false;
+        }
+
+        debug(format("switching to new user environment"));
+        Path generation = createGeneration(ref<LocalFSStore>(store2), profile, topLevelOut);
+        switchLink(profile, generation);
     }
-
-    debug(format("switching to new user environment"));
-    Path generation = createGeneration(profile, topLevelOut);
-    switchLink(profile, generation);
 
     return true;
 }

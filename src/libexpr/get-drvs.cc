@@ -30,7 +30,7 @@ string DrvInfo::queryOutPath()
 }
 
 
-DrvInfo::Outputs DrvInfo::queryOutputs()
+DrvInfo::Outputs DrvInfo::queryOutputs(bool onlyOutputsToInstall)
 {
     if (outputs.empty()) {
         /* Get the ‘outputs’ list. */
@@ -55,7 +55,23 @@ DrvInfo::Outputs DrvInfo::queryOutputs()
         } else
             outputs["out"] = queryOutPath();
     }
-    return outputs;
+    if (!onlyOutputsToInstall || !attrs)
+        return outputs;
+
+    /* Check for `meta.outputsToInstall` and return `outputs` reduced to that. */
+    const Value * outTI = queryMeta("outputsToInstall");
+    if (!outTI) return outputs;
+    const auto errMsg = Error("this derivation has bad ‘meta.outputsToInstall’");
+        /* ^ this shows during `nix-env -i` right under the bad derivation */
+    if (!outTI->isList()) throw errMsg;
+    Outputs result;
+    for (auto i = outTI->listElems(); i != outTI->listElems() + outTI->listSize(); ++i) {
+        if ((*i)->type != tString) throw errMsg;
+        auto out = outputs.find((*i)->string.s);
+        if (out == outputs.end()) throw errMsg;
+        result.insert(*out);
+    }
+    return result;
 }
 
 
@@ -106,7 +122,8 @@ bool DrvInfo::checkMeta(Value & v)
             if (!checkMeta(*i.value)) return false;
         return true;
     }
-    else return v.type == tInt || v.type == tBool || v.type == tString;
+    else return v.type == tInt || v.type == tBool || v.type == tString ||
+                v.type == tFloat;
 }
 
 
@@ -127,7 +144,7 @@ string DrvInfo::queryMetaString(const string & name)
 }
 
 
-int DrvInfo::queryMetaInt(const string & name, int def)
+NixInt DrvInfo::queryMetaInt(const string & name, NixInt def)
 {
     Value * v = queryMeta(name);
     if (!v) return def;
@@ -135,8 +152,22 @@ int DrvInfo::queryMetaInt(const string & name, int def)
     if (v->type == tString) {
         /* Backwards compatibility with before we had support for
            integer meta fields. */
-        int n;
+        NixInt n;
         if (string2Int(v->string.s, n)) return n;
+    }
+    return def;
+}
+
+NixFloat DrvInfo::queryMetaFloat(const string & name, NixFloat def)
+{
+    Value * v = queryMeta(name);
+    if (!v) return def;
+    if (v->type == tFloat) return v->fpoint;
+    if (v->type == tString) {
+        /* Backwards compatibility with before we had support for
+           float meta fields. */
+        NixFloat n;
+        if (string2Float(v->string.s, n)) return n;
     }
     return def;
 }
@@ -177,8 +208,8 @@ typedef set<Bindings *> Done;
 
 
 /* Evaluate value `v'.  If it evaluates to a set of type `derivation',
-   then put information about it in `drvs' (unless it's already in
-   `doneExprs').  The result boolean indicates whether it makes sense
+   then put information about it in `drvs' (unless it's already in `done').
+   The result boolean indicates whether it makes sense
    for the caller to recursively search for derivations in `v'. */
 static bool getDerivation(EvalState & state, Value & v,
     const string & attrPath, DrvInfos & drvs, Done & done,
@@ -259,7 +290,7 @@ static void getDerivations(EvalState & state, Value & vIn,
             attrs.insert(std::pair<string, Symbol>(i.name, i.name));
 
         for (auto & i : attrs) {
-            startNest(nest, lvlDebug, format("evaluating attribute ‘%1%’") % i.first);
+            Activity act(*logger, lvlDebug, format("evaluating attribute ‘%1%’") % i.first);
             string pathPrefix2 = addToPath(pathPrefix, i.first);
             Value & v2(*v.attrs->find(i.second)->value);
             if (combineChannels)
@@ -270,7 +301,7 @@ static void getDerivations(EvalState & state, Value & vIn,
                    `recurseForDerivations = true' attribute. */
                 if (v2.type == tAttrs) {
                     Bindings::iterator j = v2.attrs->find(state.symbols.create("recurseForDerivations"));
-                    if (j != v2.attrs->end() && state.forceBool(*j->value))
+                    if (j != v2.attrs->end() && state.forceBool(*j->value, *j->pos))
                         getDerivations(state, v2, pathPrefix2, autoArgs, drvs, done, ignoreAssertionFailures);
                 }
             }
@@ -279,8 +310,7 @@ static void getDerivations(EvalState & state, Value & vIn,
 
     else if (v.isList()) {
         for (unsigned int n = 0; n < v.listSize(); ++n) {
-            startNest(nest, lvlDebug,
-                format("evaluating list element"));
+            Activity act(*logger, lvlDebug, "evaluating list element");
             string pathPrefix2 = addToPath(pathPrefix, (format("%1%") % n).str());
             if (getDerivation(state, *v.listElems()[n], pathPrefix2, drvs, done, ignoreAssertionFailures))
                 getDerivations(state, *v.listElems()[n], pathPrefix2, autoArgs, drvs, done, ignoreAssertionFailures);

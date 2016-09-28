@@ -6,7 +6,7 @@ namespace nix {
 #define WORKER_MAGIC_1 0x6e697863
 #define WORKER_MAGIC_2 0x6478696f
 
-#define PROTOCOL_VERSION 0x10f
+#define PROTOCOL_VERSION 0x111
 #define GET_PROTOCOL_MAJOR(x) ((x) & 0xff00)
 #define GET_PROTOCOL_MINOR(x) ((x) & 0x00ff)
 
@@ -14,8 +14,8 @@ namespace nix {
 typedef enum {
     wopIsValidPath = 1,
     wopHasSubstitutes = 3,
-    wopQueryPathHash = 4,
-    wopQueryReferences = 5,
+    wopQueryPathHash = 4, // obsolete
+    wopQueryReferences = 5, // obsolete
     wopQueryReferrers = 6,
     wopAddToStore = 7,
     wopAddTextToStore = 8,
@@ -25,8 +25,8 @@ typedef enum {
     wopAddIndirectRoot = 12,
     wopSyncWithGC = 13,
     wopFindRoots = 14,
-    wopExportPath = 16,
-    wopQueryDeriver = 18,
+    wopExportPath = 16, // obsolete
+    wopQueryDeriver = 18, // obsolete
     wopSetOptions = 19,
     wopCollectGarbage = 20,
     wopQuerySubstitutablePathInfo = 21,
@@ -35,7 +35,7 @@ typedef enum {
     wopQueryFailedPaths = 24,
     wopClearFailedPaths = 25,
     wopQueryPathInfo = 26,
-    wopImportPaths = 27,
+    wopImportPaths = 27, // obsolete
     wopQueryDerivationOutputNames = 28,
     wopQueryPathFromHashPart = 29,
     wopQuerySubstitutablePathInfos = 30,
@@ -45,6 +45,7 @@ typedef enum {
     wopOptimiseStore = 34,
     wopVerifyStore = 35,
     wopBuildDerivation = 36,
+    wopAddSignatures = 37,
 } WorkerOp;
 
 
@@ -55,8 +56,8 @@ typedef enum {
 #define STDERR_ERROR 0x63787470
 
 
-Path readStorePath(Source & from);
-template<class T> T readStorePaths(Source & from);
+Path readStorePath(Store & store, Source & from);
+template<class T> T readStorePaths(Store & store, Source & from);
 
 
 }

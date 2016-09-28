@@ -1,218 +1,267 @@
-#include "misc.hh"
-#include "store-api.hh"
-#include "local-store.hh"
+#include "derivations.hh"
 #include "globals.hh"
+#include "local-store.hh"
+#include "store-api.hh"
+#include "thread-pool.hh"
 
 
 namespace nix {
 
 
-Derivation derivationFromPath(StoreAPI & store, const Path & drvPath)
+void Store::computeFSClosure(const Path & startPath,
+    PathSet & paths_, bool flipDirection, bool includeOutputs, bool includeDerivers)
 {
-    assertStorePath(drvPath);
-    store.ensurePath(drvPath);
-    return readDerivation(drvPath);
-}
+    struct State
+    {
+        size_t pending;
+        PathSet & paths;
+        std::exception_ptr exc;
+    };
 
+    Sync<State> state_(State{0, paths_, 0});
 
-void computeFSClosure(StoreAPI & store, const Path & path,
-    PathSet & paths, bool flipDirection, bool includeOutputs, bool includeDerivers)
-{
-    if (paths.find(path) != paths.end()) return;
-    paths.insert(path);
+    std::function<void(const Path &)> enqueue;
 
-    PathSet edges;
+    std::condition_variable done;
 
-    if (flipDirection) {
-        store.queryReferrers(path, edges);
-
-        if (includeOutputs) {
-            PathSet derivers = store.queryValidDerivers(path);
-            for (auto & i : derivers)
-                edges.insert(i);
+    enqueue = [&](const Path & path) -> void {
+        {
+            auto state(state_.lock());
+            if (state->exc) return;
+            if (state->paths.count(path)) return;
+            state->paths.insert(path);
+            state->pending++;
         }
 
-        if (includeDerivers && isDerivation(path)) {
-            PathSet outputs = store.queryDerivationOutputs(path);
-            for (auto & i : outputs)
-                if (store.isValidPath(i) && store.queryDeriver(i) == path)
-                    edges.insert(i);
-        }
+        queryPathInfo(path,
+            [&, path](ref<ValidPathInfo> info) {
+                // FIXME: calls to isValidPath() should be async
 
-    } else {
-        store.queryReferences(path, edges);
+                if (flipDirection) {
 
-        if (includeOutputs && isDerivation(path)) {
-            PathSet outputs = store.queryDerivationOutputs(path);
-            for (auto & i : outputs)
-                if (store.isValidPath(i)) edges.insert(i);
-        }
+                    PathSet referrers;
+                    queryReferrers(path, referrers);
+                    for (auto & ref : referrers)
+                        if (ref != path)
+                            enqueue(ref);
 
-        if (includeDerivers) {
-            Path deriver = store.queryDeriver(path);
-            if (store.isValidPath(deriver)) edges.insert(deriver);
-        }
-    }
+                    if (includeOutputs)
+                        for (auto & i : queryValidDerivers(path))
+                            enqueue(i);
 
-    for (auto & i : edges)
-        computeFSClosure(store, i, paths, flipDirection, includeOutputs, includeDerivers);
-}
+                    if (includeDerivers && isDerivation(path))
+                        for (auto & i : queryDerivationOutputs(path))
+                            if (isValidPath(i) && queryPathInfo(i)->deriver == path)
+                                enqueue(i);
 
+                } else {
 
-Path findOutput(const Derivation & drv, string id)
-{
-    for (auto & i : drv.outputs)
-        if (i.first == id) return i.second.path;
-    throw Error(format("derivation has no output ‘%1%’") % id);
-}
+                    for (auto & ref : info->references)
+                        if (ref != path)
+                            enqueue(ref);
 
+                    if (includeOutputs && isDerivation(path))
+                        for (auto & i : queryDerivationOutputs(path))
+                            if (isValidPath(i)) enqueue(i);
 
-void queryMissing(StoreAPI & store, const PathSet & targets,
-    PathSet & willBuild, PathSet & willSubstitute, PathSet & unknown,
-    unsigned long long & downloadSize, unsigned long long & narSize)
-{
-    downloadSize = narSize = 0;
+                    if (includeDerivers && isValidPath(info->deriver))
+                        enqueue(info->deriver);
 
-    PathSet todo(targets.begin(), targets.end()), done;
-
-    /* Getting substitute info has high latency when using the binary
-       cache substituter.  Thus it's essential to do substitute
-       queries in parallel as much as possible.  To accomplish this
-       we do the following:
-
-       - For all paths still to be processed (‘todo’), we add all
-         paths for which we need info to the set ‘query’.  For an
-         unbuilt derivation this is the output paths; otherwise, it's
-         the path itself.
-
-       - We get info about all paths in ‘query’ in parallel.
-
-       - We process the results and add new items to ‘todo’ if
-         necessary.  E.g. if a path is substitutable, then we need to
-         get info on its references.
-
-       - Repeat until ‘todo’ is empty.
-    */
-
-    while (!todo.empty()) {
-
-        PathSet query, todoDrv, todoNonDrv;
-
-        for (auto & i : todo) {
-            if (done.find(i) != done.end()) continue;
-            done.insert(i);
-
-            DrvPathWithOutputs i2 = parseDrvPathWithOutputs(i);
-
-            if (isDerivation(i2.first)) {
-                if (!store.isValidPath(i2.first)) {
-                    // FIXME: we could try to substitute p.
-                    unknown.insert(i);
-                    continue;
                 }
-                Derivation drv = derivationFromPath(store, i2.first);
 
-                PathSet invalid;
-                for (auto & j : drv.outputs)
-                    if (wantOutput(j.first, i2.second)
-                        && !store.isValidPath(j.second.path))
-                        invalid.insert(j.second.path);
-                if (invalid.empty()) continue;
+                {
+                    auto state(state_.lock());
+                    assert(state->pending);
+                    if (!--state->pending) done.notify_one();
+                }
 
-                todoDrv.insert(i);
-                if (settings.useSubstitutes && substitutesAllowed(drv))
-                    query.insert(invalid.begin(), invalid.end());
-            }
+            },
 
-            else {
-                if (store.isValidPath(i)) continue;
-                query.insert(i);
-                todoNonDrv.insert(i);
-            }
+            [&, path](std::exception_ptr exc) {
+                auto state(state_.lock());
+                if (!state->exc) state->exc = exc;
+                assert(state->pending);
+                if (!--state->pending) done.notify_one();
+            });
+    };
+
+    enqueue(startPath);
+
+    {
+        auto state(state_.lock());
+        while (state->pending) state.wait(done);
+        if (state->exc) std::rethrow_exception(state->exc);
+    }
+}
+
+
+void Store::queryMissing(const PathSet & targets,
+    PathSet & willBuild_, PathSet & willSubstitute_, PathSet & unknown_,
+    unsigned long long & downloadSize_, unsigned long long & narSize_)
+{
+    downloadSize_ = narSize_ = 0;
+
+    ThreadPool pool;
+
+    struct State
+    {
+        PathSet done;
+        PathSet & unknown, & willSubstitute, & willBuild;
+        unsigned long long & downloadSize;
+        unsigned long long & narSize;
+    };
+
+    struct DrvState
+    {
+        size_t left;
+        bool done = false;
+        PathSet outPaths;
+        DrvState(size_t left) : left(left) { }
+    };
+
+    Sync<State> state_(State{PathSet(), unknown_, willSubstitute_, willBuild_, downloadSize_, narSize_});
+
+    std::function<void(Path)> doPath;
+
+    auto mustBuildDrv = [&](const Path & drvPath, const Derivation & drv) {
+        {
+            auto state(state_.lock());
+            state->willBuild.insert(drvPath);
         }
 
-        todo.clear();
+        for (auto & i : drv.inputDrvs)
+            pool.enqueue(std::bind(doPath, makeDrvPathWithOutputs(i.first, i.second)));
+    };
+
+    auto checkOutput = [&](
+        const Path & drvPath, ref<Derivation> drv, const Path & outPath, ref<Sync<DrvState>> drvState_)
+    {
+        if (drvState_->lock()->done) return;
 
         SubstitutablePathInfos infos;
-        store.querySubstitutablePathInfos(query, infos);
+        querySubstitutablePathInfos({outPath}, infos);
 
-        for (auto & i : todoDrv) {
-            DrvPathWithOutputs i2 = parseDrvPathWithOutputs(i);
-
-            // FIXME: cache this
-            Derivation drv = derivationFromPath(store, i2.first);
-
-            PathSet outputs;
-            bool mustBuild = false;
-            if (settings.useSubstitutes && substitutesAllowed(drv)) {
-                for (auto & j : drv.outputs) {
-                    if (!wantOutput(j.first, i2.second)) continue;
-                    if (!store.isValidPath(j.second.path)) {
-                        if (infos.find(j.second.path) == infos.end())
-                            mustBuild = true;
-                        else
-                            outputs.insert(j.second.path);
-                    }
+        if (infos.empty()) {
+            drvState_->lock()->done = true;
+            mustBuildDrv(drvPath, *drv);
+        } else {
+            {
+                auto drvState(drvState_->lock());
+                if (drvState->done) return;
+                assert(drvState->left);
+                drvState->left--;
+                drvState->outPaths.insert(outPath);
+                if (!drvState->left) {
+                    for (auto & path : drvState->outPaths)
+                        pool.enqueue(std::bind(doPath, path));
                 }
-            } else
-                mustBuild = true;
+            }
+        }
+    };
 
-            if (mustBuild) {
-                willBuild.insert(i2.first);
-                todo.insert(drv.inputSrcs.begin(), drv.inputSrcs.end());
-                for (auto & j : drv.inputDrvs)
-                    todo.insert(makeDrvPathWithOutputs(j.first, j.second));
-            } else
-                todoNonDrv.insert(outputs.begin(), outputs.end());
+    doPath = [&](const Path & path) {
+
+        {
+            auto state(state_.lock());
+            if (state->done.count(path)) return;
+            state->done.insert(path);
         }
 
-        for (auto & i : todoNonDrv) {
-            done.insert(i);
-            SubstitutablePathInfos::iterator info = infos.find(i);
-            if (info != infos.end()) {
-                willSubstitute.insert(i);
-                downloadSize += info->second.downloadSize;
-                narSize += info->second.narSize;
-                todo.insert(info->second.references.begin(), info->second.references.end());
+        DrvPathWithOutputs i2 = parseDrvPathWithOutputs(path);
+
+        if (isDerivation(i2.first)) {
+            if (!isValidPath(i2.first)) {
+                // FIXME: we could try to substitute the derivation.
+                auto state(state_.lock());
+                state->unknown.insert(path);
+                return;
+            }
+
+            Derivation drv = derivationFromPath(i2.first);
+
+            PathSet invalid;
+            for (auto & j : drv.outputs)
+                if (wantOutput(j.first, i2.second)
+                    && !isValidPath(j.second.path))
+                    invalid.insert(j.second.path);
+            if (invalid.empty()) return;
+
+            if (settings.useSubstitutes && drv.substitutesAllowed()) {
+                auto drvState = make_ref<Sync<DrvState>>(DrvState(invalid.size()));
+                for (auto & output : invalid)
+                    pool.enqueue(std::bind(checkOutput, i2.first, make_ref<Derivation>(drv), output, drvState));
             } else
-                unknown.insert(i);
+                mustBuildDrv(i2.first, drv);
+
+        } else {
+
+            if (isValidPath(path)) return;
+
+            SubstitutablePathInfos infos;
+            querySubstitutablePathInfos({path}, infos);
+
+            if (infos.empty()) {
+                auto state(state_.lock());
+                state->unknown.insert(path);
+                return;
+            }
+
+            auto info = infos.find(path);
+            assert(info != infos.end());
+
+            {
+                auto state(state_.lock());
+                state->willSubstitute.insert(path);
+                state->downloadSize += info->second.downloadSize;
+                state->narSize += info->second.narSize;
+            }
+
+            for (auto & ref : info->second.references)
+                pool.enqueue(std::bind(doPath, ref));
         }
-    }
+    };
+
+    for (auto & path : targets)
+        pool.enqueue(std::bind(doPath, path));
+
+    pool.process();
 }
 
 
-static void dfsVisit(StoreAPI & store, const PathSet & paths,
-    const Path & path, PathSet & visited, Paths & sorted,
-    PathSet & parents)
-{
-    if (parents.find(path) != parents.end())
-        throw BuildError(format("cycle detected in the references of ‘%1%’") % path);
-
-    if (visited.find(path) != visited.end()) return;
-    visited.insert(path);
-    parents.insert(path);
-
-    PathSet references;
-    if (store.isValidPath(path))
-        store.queryReferences(path, references);
-
-    for (auto & i : references)
-        /* Don't traverse into paths that don't exist.  That can
-           happen due to substitutes for non-existent paths. */
-        if (i != path && paths.find(i) != paths.end())
-            dfsVisit(store, paths, i, visited, sorted, parents);
-
-    sorted.push_front(path);
-    parents.erase(path);
-}
-
-
-Paths topoSortPaths(StoreAPI & store, const PathSet & paths)
+Paths Store::topoSortPaths(const PathSet & paths)
 {
     Paths sorted;
     PathSet visited, parents;
+
+    std::function<void(const Path & path, const Path * parent)> dfsVisit;
+
+    dfsVisit = [&](const Path & path, const Path * parent) {
+        if (parents.find(path) != parents.end())
+            throw BuildError(format("cycle detected in the references of ‘%1%’ from ‘%2%’") % path % *parent);
+
+        if (visited.find(path) != visited.end()) return;
+        visited.insert(path);
+        parents.insert(path);
+
+        PathSet references;
+        try {
+            references = queryPathInfo(path)->references;
+        } catch (InvalidPath &) {
+        }
+
+        for (auto & i : references)
+            /* Don't traverse into paths that don't exist.  That can
+               happen due to substitutes for non-existent paths. */
+            if (i != path && paths.find(i) != paths.end())
+                dfsVisit(i, &path);
+
+        sorted.push_front(path);
+        parents.erase(path);
+    };
+
     for (auto & i : paths)
-        dfsVisit(store, paths, i, visited, sorted, parents);
+        dfsVisit(i, nullptr);
+
     return sorted;
 }
 

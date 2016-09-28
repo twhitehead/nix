@@ -2,7 +2,7 @@ set -e
 
 datadir="@datadir@"
 
-export TEST_ROOT=$(pwd)/test-tmp
+export TEST_ROOT=${TMPDIR:-/tmp}/nix-test
 export NIX_STORE_DIR
 if ! NIX_STORE_DIR=$(readlink -f $TEST_ROOT/store 2> /dev/null); then
     # Maybe the build directory is symlinked.
@@ -12,13 +12,17 @@ fi
 export NIX_LOCALSTATE_DIR=$TEST_ROOT/var
 export NIX_LOG_DIR=$TEST_ROOT/var/log/nix
 export NIX_STATE_DIR=$TEST_ROOT/var/nix
-export NIX_DB_DIR=$TEST_ROOT/db
 export NIX_CONF_DIR=$TEST_ROOT/etc
 export NIX_MANIFESTS_DIR=$TEST_ROOT/var/nix/manifests
 export _NIX_TEST_SHARED=$TEST_ROOT/shared
 export NIX_REMOTE=$NIX_REMOTE_
+unset NIX_PATH
+export TEST_HOME=$TEST_ROOT/test-home
+export HOME=$TEST_HOME
+mkdir -p $TEST_HOME
 
 export PATH=@bindir@:$PATH
+coreutils=@coreutils@
 
 export NIX_BUILD_HOOK=
 export dot=@dot@
@@ -46,20 +50,18 @@ clearStore() {
     chmod -R +w "$NIX_STORE_DIR"
     rm -rf "$NIX_STORE_DIR"
     mkdir "$NIX_STORE_DIR"
-    rm -rf "$NIX_DB_DIR"
-    mkdir "$NIX_DB_DIR"
+    rm -rf "$NIX_STATE_DIR"
+    mkdir "$NIX_STATE_DIR"
     nix-store --init
     clearProfiles
-    rm -f "$NIX_STATE_DIR"/gcroots/auto/*
-    rm -f "$NIX_STATE_DIR"/gcroots/ref
-}
-
-clearManifests() {
-    rm -f $NIX_STATE_DIR/manifests/*
 }
 
 clearCache() {
     rm -rf "$cacheDir"
+}
+
+clearCacheCache() {
+    rm -f $TEST_HOME/.cache/nix/binary-cache*
 }
 
 startDaemon() {

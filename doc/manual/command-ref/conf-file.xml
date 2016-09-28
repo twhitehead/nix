@@ -306,21 +306,6 @@ flag, e.g. <literal>--option gc-keep-outputs false</literal>.</para>
   </varlistentry>
 
 
-  <varlistentry><term><literal>build-cache-failure</literal></term>
-
-    <listitem><para>If set to <literal>true</literal>, Nix will
-    “cache” build failures, meaning that it will remember (in its
-    database) that a derivation previously failed.  If you then try to
-    build the derivation again, Nix will immediately fail rather than
-    perform the build again.  Failures in fixed-output derivations
-    (such as <function>fetchurl</function> calls) are never cached.
-    The “failed” status of a derivation can be cleared using
-    <command>nix-store --clear-failed-paths</command>.  By default,
-    failure caching is disabled.</para></listitem>
-
-  </varlistentry>
-
-
   <varlistentry><term><literal>build-keep-log</literal></term>
 
     <listitem><para>If set to <literal>true</literal> (the default),
@@ -423,10 +408,9 @@ flag, e.g. <literal>--option gc-keep-outputs false</literal>.</para>
 
   <varlistentry><term><literal>binary-caches-parallel-connections</literal></term>
 
-    <listitem><para>The maximum number of parallel HTTP connections
-    used by the binary cache substituter to get NAR info files.  This
-    number should be high to minimise latency.  It defaults to
-    25.</para></listitem>
+    <listitem><para>The maximum number of parallel TCP connections
+    used to fetch files from binary caches and by other downloads. It
+    defaults to 25. 0 means no limit.</para></listitem>
 
   </varlistentry>
 
@@ -440,32 +424,20 @@ flag, e.g. <literal>--option gc-keep-outputs false</literal>.</para>
   </varlistentry>
 
 
-  <varlistentry><term><literal>force-manifest</literal></term>
-
-    <listitem><para>If this option is set to <literal>false</literal>
-    (default) and a Nix channel provides both a manifest and a binary
-    cache, only the binary cache will be used.  If set to
-    <literal>true</literal>, the manifest will be fetched as well.
-    This is useful if you want to use binary patches (which are
-    currently not supported by binary caches).</para></listitem>
-
-  </varlistentry>
-
-
   <varlistentry><term><literal>system</literal></term>
 
     <listitem><para>This option specifies the canonical Nix system
     name of the current installation, such as
     <literal>i686-linux</literal> or
-    <literal>powerpc-darwin</literal>.  Nix can only build derivations
+    <literal>x86_64-darwin</literal>.  Nix can only build derivations
     whose <literal>system</literal> attribute equals the value
     specified here.  In general, it never makes sense to modify this
     value from its default, since you can use it to ‘lie’ about the
     platform you are building on (e.g., perform a Mac OS build on a
     Linux machine; the result would obviously be wrong).  It only
     makes sense if the Nix binaries can run on multiple platforms,
-    e.g., ‘universal binaries’ that run on <literal>powerpc-darwin</literal> and
-    <literal>i686-darwin</literal>.</para>
+    e.g., ‘universal binaries’ that run on <literal>x86_64-linux</literal> and
+    <literal>i686-linux</literal>.</para>
 
     <para>It defaults to the canonical Nix system name detected by
     <filename>configure</filename> at build time.</para></listitem>
@@ -626,6 +598,19 @@ flag, e.g. <literal>--option gc-keep-outputs false</literal>.</para>
     times. If the contents of any of the runs differs from the
     previous ones, the build is rejected and the resulting store paths
     are not registered as “valid” in Nix’s database.</para></listitem>
+
+  </varlistentry>
+
+
+  <varlistentry xml:id="conf-sandbox-dev-shm-size"><term><literal>sandbox-dev-shm-size</literal></term>
+
+    <listitem><para>This option determines the maximum size of the
+    <literal>tmpfs</literal> filesystem mounted on
+    <filename>/dev/shm</filename> in Linux sandboxes. For the format,
+    see the description of the <option>size</option> option of
+    <literal>tmpfs</literal> in
+    <citerefentry><refentrytitle>mount</refentrytitle><manvolnum>8</manvolnum></citerefentry>. The
+    default is <literal>50%</literal>.</para></listitem>
 
   </varlistentry>
 

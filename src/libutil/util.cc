@@ -9,6 +9,7 @@
 #include <cstdlib>
 #include <sstream>
 #include <cstring>
+#include <cctype>
 
 #include <sys/wait.h>
 #include <unistd.h>
@@ -30,13 +31,6 @@ extern char * * environ;
 namespace nix {
 
 
-BaseError::BaseError(const FormatOrString & fs, unsigned int status)
-    : status(status)
-{
-    err = fs.s;
-}
-
-
 BaseError & BaseError::addPrefix(const FormatOrString & fs)
 {
     prefix_ = fs.s + prefix_;
@@ -44,10 +38,10 @@ BaseError & BaseError::addPrefix(const FormatOrString & fs)
 }
 
 
-SysError::SysError(const FormatOrString & fs)
-    : Error(format("%1%: %2%") % fs.s % strerror(errno))
-    , errNo(errno)
+std::string SysError::addErrno(const std::string & s)
 {
+    errNo = errno;
+    return s + ": " + strerror(errNo);
 }
 
 
@@ -55,6 +49,21 @@ string getEnv(const string & key, const string & def)
 {
     char * value = getenv(key.c_str());
     return value ? string(value) : def;
+}
+
+
+std::map<std::string, std::string> getEnv()
+{
+    std::map<std::string, std::string> env;
+    for (size_t i = 0; environ[i]; ++i) {
+        auto s = environ[i];
+        auto eq = strchr(s, '=');
+        if (!eq)
+            // invalid env, just keep going
+            continue;
+        env.emplace(std::string(s, eq), std::string(eq + 1));
+    }
+    return env;
 }
 
 
@@ -150,7 +159,7 @@ Path dirOf(const Path & path)
 string baseNameOf(const Path & path)
 {
     if (path.empty())
-        return string("");
+        return "";
 
     Path::size_type last = path.length() - 1;
     if (path[last] == '/' && last > 0)
@@ -161,6 +170,7 @@ string baseNameOf(const Path & path)
         pos = 0;
     else
         pos += 1;
+
     return string(path, pos, last - pos + 1);
 }
 
@@ -208,7 +218,7 @@ Path readLink(const Path & path)
     else if (rlsize > st.st_size)
         throw Error(format("symbolic link ‘%1%’ size overflow %2% > %3%")
             % path % rlsize % st.st_size);
-    return string(buf, st.st_size);
+    return string(buf, rlsize);
 }
 
 
@@ -272,19 +282,19 @@ string readFile(int fd)
 
 string readFile(const Path & path, bool drain)
 {
-    AutoCloseFD fd = open(path.c_str(), O_RDONLY);
-    if (fd == -1)
+    AutoCloseFD fd = open(path.c_str(), O_RDONLY | O_CLOEXEC);
+    if (!fd)
         throw SysError(format("opening file ‘%1%’") % path);
-    return drain ? drainFD(fd) : readFile(fd);
+    return drain ? drainFD(fd.get()) : readFile(fd.get());
 }
 
 
 void writeFile(const Path & path, const string & s)
 {
-    AutoCloseFD fd = open(path.c_str(), O_WRONLY | O_TRUNC | O_CREAT, 0666);
-    if (fd == -1)
+    AutoCloseFD fd = open(path.c_str(), O_WRONLY | O_TRUNC | O_CREAT | O_CLOEXEC, 0666);
+    if (!fd)
         throw SysError(format("opening file ‘%1%’") % path);
-    writeFull(fd, s);
+    writeFull(fd.get(), s);
 }
 
 
@@ -319,9 +329,11 @@ static void _deletePath(const Path & path, unsigned long long & bytesFreed)
 {
     checkInterrupt();
 
-    printMsg(lvlVomit, format("%1%") % path);
-
-    struct stat st = lstat(path);
+    struct stat st;
+    if (lstat(path.c_str(), &st) == -1) {
+        if (errno == ENOENT) return;
+        throw SysError(format("getting status of ‘%1%’") % path);
+    }
 
     if (!S_ISDIR(st.st_mode) && st.st_nlink == 1)
         bytesFreed += st.st_blocks * 512;
@@ -337,8 +349,10 @@ static void _deletePath(const Path & path, unsigned long long & bytesFreed)
             _deletePath(path + "/" + i.name, bytesFreed);
     }
 
-    if (remove(path.c_str()) == -1)
+    if (remove(path.c_str()) == -1) {
+        if (errno == ENOENT) return;
         throw SysError(format("cannot unlink ‘%1%’") % path);
+    }
 }
 
 
@@ -351,8 +365,7 @@ void deletePath(const Path & path)
 
 void deletePath(const Path & path, unsigned long long & bytesFreed)
 {
-    startNest(nest, lvlDebug,
-        format("recursively deleting path ‘%1%’") % path);
+    Activity act(*logger, lvlDebug, format("recursively deleting path ‘%1%’") % path);
     bytesFreed = 0;
     _deletePath(path, bytesFreed);
 }
@@ -380,6 +393,7 @@ Path createTempDir(const Path & tmpRoot, const Path & prefix,
         checkInterrupt();
         Path tmpDir = tempName(tmpRoot, prefix, includePid, counter);
         if (mkdir(tmpDir.c_str(), mode) == 0) {
+#if __FreeBSD__
             /* Explicitly set the group of the directory.  This is to
                work around around problems caused by BSD's group
                ownership semantics (directories inherit the group of
@@ -390,11 +404,24 @@ Path createTempDir(const Path & tmpRoot, const Path & prefix,
                have the setgid bit set on directories. */
             if (chown(tmpDir.c_str(), (uid_t) -1, getegid()) != 0)
                 throw SysError(format("setting group of directory ‘%1%’") % tmpDir);
+#endif
             return tmpDir;
         }
         if (errno != EEXIST)
             throw SysError(format("creating directory ‘%1%’") % tmpDir);
     }
+}
+
+
+Path getCacheDir()
+{
+    Path cacheDir = getEnv("XDG_CACHE_HOME");
+    if (cacheDir.empty()) {
+        Path homeDir = getEnv("HOME");
+        if (homeDir.empty()) throw Error("$XDG_CACHE_HOME and $HOME are not set");
+        cacheDir = homeDir + "/.cache";
+    }
+    return cacheDir;
 }
 
 
@@ -439,113 +466,6 @@ void replaceSymlink(const Path & target, const Path & link)
 }
 
 
-LogType logType = ltPretty;
-Verbosity verbosity = lvlInfo;
-
-static int nestingLevel = 0;
-
-
-Nest::Nest()
-{
-    nest = false;
-}
-
-
-Nest::~Nest()
-{
-    close();
-}
-
-
-static string escVerbosity(Verbosity level)
-{
-    return std::to_string((int) level);
-}
-
-
-void Nest::open(Verbosity level, const FormatOrString & fs)
-{
-    if (level <= verbosity) {
-        if (logType == ltEscapes)
-            std::cerr << "\033[" << escVerbosity(level) << "p"
-                      << fs.s << "\n";
-        else
-            printMsg_(level, fs);
-        nest = true;
-        nestingLevel++;
-    }
-}
-
-
-void Nest::close()
-{
-    if (nest) {
-        nestingLevel--;
-        if (logType == ltEscapes)
-            std::cerr << "\033[q";
-        nest = false;
-    }
-}
-
-
-void printMsg_(Verbosity level, const FormatOrString & fs)
-{
-    checkInterrupt();
-    if (level > verbosity) return;
-
-    string prefix;
-    if (logType == ltPretty)
-        for (int i = 0; i < nestingLevel; i++)
-            prefix += "|   ";
-    else if (logType == ltEscapes && level != lvlInfo)
-        prefix = "\033[" + escVerbosity(level) + "s";
-    else if (logType == ltSystemd) {
-        char c;
-        switch (level) {
-            case lvlError: c = '3'; break;
-            case lvlInfo: c = '5'; break;
-            case lvlTalkative: case lvlChatty: c = '6'; break;
-            default: c = '7';
-        }
-        prefix = string("<") + c + ">";
-    }
-
-    string s = (format("%1%%2%\n") % prefix % fs.s).str();
-    if (!isatty(STDERR_FILENO)) s = filterANSIEscapes(s);
-    writeToStderr(s);
-}
-
-
-void warnOnce(bool & haveWarned, const FormatOrString & fs)
-{
-    if (!haveWarned) {
-        printMsg(lvlError, format("warning: %1%") % fs.s);
-        haveWarned = true;
-    }
-}
-
-
-void writeToStderr(const string & s)
-{
-    try {
-        if (_writeToStderr)
-            _writeToStderr((const unsigned char *) s.data(), s.size());
-        else
-            writeFull(STDERR_FILENO, s);
-    } catch (SysError & e) {
-        /* Ignore failing writes to stderr if we're in an exception
-           handler, otherwise throw an exception.  We need to ignore
-           write errors in exception handlers to ensure that cleanup
-           code runs to completion if the other side of stderr has
-           been closed unexpectedly. */
-        if (!std::uncaught_exception()) throw;
-    }
-}
-
-
-void (*_writeToStderr) (const unsigned char * buf, size_t count) = 0;
-
-
 void readFull(int fd, unsigned char * buf, size_t count)
 {
     while (count) {
@@ -562,24 +482,24 @@ void readFull(int fd, unsigned char * buf, size_t count)
 }
 
 
-void writeFull(int fd, const unsigned char * buf, size_t count)
+void writeFull(int fd, const unsigned char * buf, size_t count, bool allowInterrupts)
 {
     while (count) {
-        checkInterrupt();
         ssize_t res = write(fd, (char *) buf, count);
-        if (res == -1) {
-            if (errno == EINTR) continue;
+        if (res == -1 && errno != EINTR)
             throw SysError("writing to file");
+        if (res > 0) {
+            count -= res;
+            buf += res;
         }
-        count -= res;
-        buf += res;
+        if (allowInterrupts) checkInterrupt();
     }
 }
 
 
-void writeFull(int fd, const string & s)
+void writeFull(int fd, const string & s, bool allowInterrupts)
 {
-    writeFull(fd, (const unsigned char *) s.data(), s.size());
+    writeFull(fd, (const unsigned char *) s.data(), s.size(), allowInterrupts);
 }
 
 
@@ -645,28 +565,24 @@ void AutoDelete::reset(const Path & p, bool recursive) {
 //////////////////////////////////////////////////////////////////////
 
 
-AutoCloseFD::AutoCloseFD()
+AutoCloseFD::AutoCloseFD() : fd{-1} {}
+
+
+AutoCloseFD::AutoCloseFD(int fd) : fd{fd} {}
+
+
+AutoCloseFD::AutoCloseFD(AutoCloseFD&& that) : fd{that.fd}
 {
-    fd = -1;
+    that.fd = -1;
 }
 
 
-AutoCloseFD::AutoCloseFD(int fd)
+AutoCloseFD& AutoCloseFD::operator =(AutoCloseFD&& that)
 {
-    this->fd = fd;
-}
-
-
-AutoCloseFD::AutoCloseFD(const AutoCloseFD & fd)
-{
-    /* Copying an AutoCloseFD isn't allowed (who should get to close
-       it?).  But as an edge case, allow copying of closed
-       AutoCloseFDs.  This is necessary due to tiresome reasons
-       involving copy constructor use on default object values in STL
-       containers (like when you do `map[value]' where value isn't in
-       the map yet). */
-    this->fd = fd.fd;
-    if (this->fd != -1) abort();
+    close();
+    fd = that.fd;
+    that.fd = -1;
+    return *this;
 }
 
 
@@ -680,14 +596,7 @@ AutoCloseFD::~AutoCloseFD()
 }
 
 
-void AutoCloseFD::operator =(int fd)
-{
-    if (this->fd != fd) close();
-    this->fd = fd;
-}
-
-
-AutoCloseFD::operator int() const
+int AutoCloseFD::get() const
 {
     return fd;
 }
@@ -699,19 +608,17 @@ void AutoCloseFD::close()
         if (::close(fd) == -1)
             /* This should never happen. */
             throw SysError(format("closing file descriptor %1%") % fd);
-        fd = -1;
     }
 }
 
 
-bool AutoCloseFD::isOpen()
+AutoCloseFD::operator bool() const
 {
     return fd != -1;
 }
 
 
-/* Pass responsibility for closing this fd to the caller. */
-int AutoCloseFD::borrow()
+int AutoCloseFD::release()
 {
     int oldFD = fd;
     fd = -1;
@@ -722,11 +629,15 @@ int AutoCloseFD::borrow()
 void Pipe::create()
 {
     int fds[2];
+#if HAVE_PIPE2
+    if (pipe2(fds, O_CLOEXEC) != 0) throw SysError("creating pipe");
+#else
     if (pipe(fds) != 0) throw SysError("creating pipe");
+    closeOnExec(fds[0]);
+    closeOnExec(fds[1]);
+#endif
     readSide = fds[0];
     writeSide = fds[1];
-    closeOnExec(readSide);
-    closeOnExec(writeSide);
 }
 
 
@@ -813,20 +724,20 @@ void Pid::kill(bool quiet)
     if (pid == -1 || pid == 0) return;
 
     if (!quiet)
-        printMsg(lvlError, format("killing process %1%") % pid);
+        printError(format("killing process %1%") % pid);
 
     /* Send the requested signal to the child.  If it has its own
        process group, send the signal to every process in the child
        process group (which hopefully includes *all* its children). */
     if (::kill(separatePG ? -pid : pid, killSignal) != 0)
-        printMsg(lvlError, (SysError(format("killing process %1%") % pid).msg()));
+        printError((SysError(format("killing process %1%") % pid).msg()));
 
     /* Wait until the child dies, disregarding the exit status. */
     int status;
     while (waitpid(pid, &status, 0) == -1) {
         checkInterrupt();
         if (errno != EINTR) {
-            printMsg(lvlError,
+            printError(
                 (SysError(format("waiting for process %1%") % pid).msg()));
             break;
         }
@@ -936,7 +847,8 @@ static pid_t doFork(bool allowVfork, std::function<void()> fun)
 pid_t startProcess(std::function<void()> fun, const ProcessOptions & options)
 {
     auto wrapper = [&]() {
-        if (!options.allowVfork) _writeToStderr = 0;
+        if (!options.allowVfork)
+            logger = makeDefaultLogger();
         try {
 #if __linux__
             if (options.dieWithParent && prctl(PR_SET_PDEATHSIG, SIGKILL) == -1)
@@ -983,10 +895,10 @@ string runProgram(Path program, bool searchPath, const Strings & args,
 
     /* Fork. */
     Pid pid = startProcess([&]() {
-        if (dup2(out.writeSide, STDOUT_FILENO) == -1)
+        if (dup2(out.writeSide.get(), STDOUT_FILENO) == -1)
             throw SysError("dupping stdout");
         if (!input.empty()) {
-            if (dup2(in.readSide, STDIN_FILENO) == -1)
+            if (dup2(in.readSide.get(), STDIN_FILENO) == -1)
                 throw SysError("dupping stdin");
         }
 
@@ -1001,21 +913,21 @@ string runProgram(Path program, bool searchPath, const Strings & args,
         throw SysError(format("executing ‘%1%’") % program);
     });
 
-    out.writeSide.close();
+    out.writeSide = -1;
 
     /* FIXME: This can deadlock if the input is too long. */
     if (!input.empty()) {
-        in.readSide.close();
-        writeFull(in.writeSide, input);
-        in.writeSide.close();
+        in.readSide = -1;
+        writeFull(in.writeSide.get(), input);
+        in.writeSide = -1;
     }
 
-    string result = drainFD(out.readSide);
+    string result = drainFD(out.readSide.get());
 
     /* Wait for the child to finish. */
     int status = pid.wait(true);
     if (!statusOk(status))
-        throw ExecError(format("program ‘%1%’ %2%")
+        throw ExecError(status, format("program ‘%1%’ %2%")
             % program % statusToString(status));
 
     return result;
@@ -1057,13 +969,15 @@ void restoreSIGPIPE()
 
 volatile sig_atomic_t _isInterrupted = 0;
 
+thread_local bool interruptThrown = false;
+
 void _interrupted()
 {
     /* Block user interrupts while an exception is being handled.
        Throwing an exception while another exception is being handled
        kills the program! */
-    if (!std::uncaught_exception()) {
-        _isInterrupted = 0;
+    if (!interruptThrown && !std::uncaught_exception()) {
+        interruptThrown = true;
         throw Interrupted("interrupted by the user");
     }
 }
@@ -1170,50 +1084,24 @@ bool statusOk(int status)
 }
 
 
+bool hasPrefix(const string & s, const string & suffix)
+{
+    return s.compare(0, suffix.size(), suffix) == 0;
+}
+
+
 bool hasSuffix(const string & s, const string & suffix)
 {
     return s.size() >= suffix.size() && string(s, s.size() - suffix.size()) == suffix;
 }
 
 
-void expect(std::istream & str, const string & s)
+std::string toLower(const std::string & s)
 {
-    char s2[s.size()];
-    str.read(s2, s.size());
-    if (string(s2, s.size()) != s)
-        throw FormatError(format("expected string ‘%1%’") % s);
-}
-
-
-string parseString(std::istream & str)
-{
-    string res;
-    expect(str, "\"");
-    int c;
-    while ((c = str.get()) != '"')
-        if (c == '\\') {
-            c = str.get();
-            if (c == 'n') res += '\n';
-            else if (c == 'r') res += '\r';
-            else if (c == 't') res += '\t';
-            else res += c;
-        }
-        else res += c;
-    return res;
-}
-
-
-bool endOfList(std::istream & str)
-{
-    if (str.peek() == ',') {
-        str.get();
-        return false;
-    }
-    if (str.peek() == ']') {
-        str.get();
-        return true;
-    }
-    return false;
+    std::string r(s);
+    for (auto & c : r)
+        c = std::tolower(c);
+    return r;
 }
 
 
@@ -1237,7 +1125,7 @@ void ignoreException()
     try {
         throw;
     } catch (std::exception & e) {
-        printMsg(lvlError, format("error (ignored): %1%") % e.what());
+        printError(format("error (ignored): %1%") % e.what());
     }
 }
 
@@ -1332,6 +1220,17 @@ string base64Decode(const string & s)
     }
 
     return res;
+}
+
+
+void callFailure(const std::function<void(std::exception_ptr exc)> & failure, std::exception_ptr exc)
+{
+    try {
+        failure(exc);
+    } catch (std::exception & e) {
+        printError(format("uncaught exception: %s") % e.what());
+        abort();
+    }
 }
 
 

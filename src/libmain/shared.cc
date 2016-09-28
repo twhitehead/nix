@@ -1,15 +1,16 @@
 #include "config.h"
 
-#include "shared.hh"
+#include "common-args.hh"
 #include "globals.hh"
+#include "shared.hh"
 #include "store-api.hh"
 #include "util.hh"
-#include "misc.hh"
 
-#include <iostream>
+#include <algorithm>
 #include <cctype>
 #include <exception>
-#include <algorithm>
+#include <iostream>
+#include <mutex>
 
 #include <cstdlib>
 #include <sys/time.h>
@@ -17,21 +18,15 @@
 #include <unistd.h>
 #include <signal.h>
 
-extern char * * environ;
+#include <openssl/crypto.h>
 
 
 namespace nix {
 
 
-volatile sig_atomic_t blockInt = 0;
-
-
 static void sigintHandler(int signo)
 {
-    if (!blockInt) {
-        _isInterrupted = 1;
-        blockInt = 1;
-    }
+    _isInterrupted = 1;
 }
 
 
@@ -47,51 +42,41 @@ void printGCWarning()
 }
 
 
-void printMissing(StoreAPI & store, const PathSet & paths)
+void printMissing(ref<Store> store, const PathSet & paths)
 {
     unsigned long long downloadSize, narSize;
     PathSet willBuild, willSubstitute, unknown;
-    queryMissing(store, paths, willBuild, willSubstitute, unknown, downloadSize, narSize);
-    printMissing(willBuild, willSubstitute, unknown, downloadSize, narSize);
+    store->queryMissing(paths, willBuild, willSubstitute, unknown, downloadSize, narSize);
+    printMissing(store, willBuild, willSubstitute, unknown, downloadSize, narSize);
 }
 
 
-void printMissing(const PathSet & willBuild,
+void printMissing(ref<Store> store, const PathSet & willBuild,
     const PathSet & willSubstitute, const PathSet & unknown,
     unsigned long long downloadSize, unsigned long long narSize)
 {
     if (!willBuild.empty()) {
-        printMsg(lvlInfo, format("these derivations will be built:"));
-        Paths sorted = topoSortPaths(*store, willBuild);
+        printInfo(format("these derivations will be built:"));
+        Paths sorted = store->topoSortPaths(willBuild);
         reverse(sorted.begin(), sorted.end());
         for (auto & i : sorted)
-            printMsg(lvlInfo, format("  %1%") % i);
+            printInfo(format("  %1%") % i);
     }
 
     if (!willSubstitute.empty()) {
-        printMsg(lvlInfo, format("these paths will be fetched (%.2f MiB download, %.2f MiB unpacked):")
+        printInfo(format("these paths will be fetched (%.2f MiB download, %.2f MiB unpacked):")
             % (downloadSize / (1024.0 * 1024.0))
             % (narSize / (1024.0 * 1024.0)));
         for (auto & i : willSubstitute)
-            printMsg(lvlInfo, format("  %1%") % i);
+            printInfo(format("  %1%") % i);
     }
 
     if (!unknown.empty()) {
-        printMsg(lvlInfo, format("don't know how to build these paths%1%:")
+        printInfo(format("don't know how to build these paths%1%:")
             % (settings.readOnlyMode ? " (may be caused by read-only store access)" : ""));
         for (auto & i : unknown)
-            printMsg(lvlInfo, format("  %1%") % i);
+            printInfo(format("  %1%") % i);
     }
-}
-
-
-static void setLogType(string lt)
-{
-    if (lt == "pretty") logType = ltPretty;
-    else if (lt == "escapes") logType = ltEscapes;
-    else if (lt == "flat") logType = ltFlat;
-    else if (lt == "systemd") logType = ltSystemd;
-    else throw UsageError("unknown log type");
 }
 
 
@@ -104,7 +89,18 @@ string getArg(const string & opt,
 }
 
 
-void detectStackOverflow();
+/* OpenSSL is not thread-safe by default - it will randomly crash
+   unless the user supplies a mutex locking function. So let's do
+   that. */
+static std::vector<std::mutex> opensslLocks;
+
+static void opensslLockCallback(int mode, int type, const char * file, int line)
+{
+    if (mode & CRYPTO_LOCK)
+        opensslLocks[type].lock();
+    else
+        opensslLocks[type].unlock();
+}
 
 
 void initNix()
@@ -115,10 +111,11 @@ void initNix()
     std::cerr.rdbuf()->pubsetbuf(buf, sizeof(buf));
 #endif
 
-    std::ios::sync_with_stdio(false);
+    logger = makeDefaultLogger();
 
-    if (getEnv("IN_SYSTEMD") == "1")
-        logType = ltSystemd;
+    /* Initialise OpenSSL locking. */
+    opensslLocks = std::vector<std::mutex>(CRYPTO_num_locks());
+    CRYPTO_set_locking_callback(opensslLockCallback);
 
     settings.processEnvironment();
     settings.loadConfFile();
@@ -165,77 +162,77 @@ void initNix()
 }
 
 
+struct LegacyArgs : public MixCommonArgs
+{
+    std::function<bool(Strings::iterator & arg, const Strings::iterator & end)> parseArg;
+
+    LegacyArgs(const std::string & programName,
+        std::function<bool(Strings::iterator & arg, const Strings::iterator & end)> parseArg)
+        : MixCommonArgs(programName), parseArg(parseArg)
+    {
+        mkFlag('Q', "no-build-output", "do not show build output",
+            &settings.verboseBuild, false);
+
+        mkFlag('K', "keep-failed", "keep temporary directories of failed builds",
+            &settings.keepFailed);
+
+        mkFlag('k', "keep-going", "keep going after a build fails",
+            &settings.keepGoing);
+
+        mkFlag(0, "fallback", "build from source if substitution fails", []() {
+            settings.set("build-fallback", "true");
+        });
+
+        auto intSettingAlias = [&](char shortName, const std::string & longName,
+            const std::string & description, const std::string & dest) {
+            mkFlag<unsigned int>(shortName, longName, description, [=](unsigned int n) {
+                settings.set(dest, std::to_string(n));
+            });
+        };
+
+        intSettingAlias('j', "max-jobs", "maximum number of parallel builds", "build-max-jobs");
+        intSettingAlias(0, "cores", "maximum number of CPU cores to use inside a build", "build-cores");
+        intSettingAlias(0, "max-silent-time", "number of seconds of silence before a build is killed", "build-max-silent-time");
+        intSettingAlias(0, "timeout", "number of seconds before a build is killed", "build-timeout");
+
+        mkFlag(0, "readonly-mode", "do not write to the Nix store",
+            &settings.readOnlyMode);
+
+        mkFlag(0, "no-build-hook", "disable use of the build hook mechanism",
+            &settings.useBuildHook, false);
+
+        mkFlag(0, "show-trace", "show Nix expression stack trace in evaluation errors",
+            &settings.showTrace);
+
+        mkFlag(0, "no-gc-warning", "disable warning about not using ‘--add-root’",
+            &gcWarning, false);
+    }
+
+    bool processFlag(Strings::iterator & pos, Strings::iterator end) override
+    {
+        if (MixCommonArgs::processFlag(pos, end)) return true;
+        bool res = parseArg(pos, end);
+        if (res) ++pos;
+        return res;
+    }
+
+    bool processArgs(const Strings & args, bool finish) override
+    {
+        if (args.empty()) return true;
+        assert(args.size() == 1);
+        Strings ss(args);
+        auto pos = ss.begin();
+        if (!parseArg(pos, ss.end()))
+            throw UsageError(format("unexpected argument ‘%1%’") % args.front());
+        return true;
+    }
+};
+
+
 void parseCmdLine(int argc, char * * argv,
     std::function<bool(Strings::iterator & arg, const Strings::iterator & end)> parseArg)
 {
-    /* Put the arguments in a vector. */
-    Strings args;
-    argc--; argv++;
-    while (argc--) args.push_back(*argv++);
-
-    /* Process default options. */
-    for (Strings::iterator i = args.begin(); i != args.end(); ++i) {
-        string arg = *i;
-
-        /* Expand compound dash options (i.e., `-qlf' -> `-q -l -f'). */
-        if (arg.length() > 2 && arg[0] == '-' && arg[1] != '-' && isalpha(arg[1])) {
-            *i = (string) "-" + arg[1];
-            auto next = i; ++next;
-            for (unsigned int j = 2; j < arg.length(); j++)
-                if (isalpha(arg[j]))
-                    args.insert(next, (string) "-" + arg[j]);
-                else {
-                    args.insert(next, string(arg, j));
-                    break;
-                }
-            arg = *i;
-        }
-
-        if (arg == "--verbose" || arg == "-v") verbosity = (Verbosity) (verbosity + 1);
-        else if (arg == "--quiet") verbosity = verbosity > lvlError ? (Verbosity) (verbosity - 1) : lvlError;
-        else if (arg == "--log-type") {
-            string s = getArg(arg, i, args.end());
-            setLogType(s);
-        }
-        else if (arg == "--no-build-output" || arg == "-Q")
-            settings.buildVerbosity = lvlVomit;
-        else if (arg == "--print-build-trace")
-            settings.printBuildTrace = true;
-        else if (arg == "--keep-failed" || arg == "-K")
-            settings.keepFailed = true;
-        else if (arg == "--keep-going" || arg == "-k")
-            settings.keepGoing = true;
-        else if (arg == "--fallback")
-            settings.set("build-fallback", "true");
-        else if (arg == "--max-jobs" || arg == "-j")
-            settings.set("build-max-jobs", getArg(arg, i, args.end()));
-        else if (arg == "--cores")
-            settings.set("build-cores", getArg(arg, i, args.end()));
-        else if (arg == "--readonly-mode")
-            settings.readOnlyMode = true;
-        else if (arg == "--max-silent-time")
-            settings.set("build-max-silent-time", getArg(arg, i, args.end()));
-        else if (arg == "--timeout")
-            settings.set("build-timeout", getArg(arg, i, args.end()));
-        else if (arg == "--no-build-hook")
-            settings.useBuildHook = false;
-        else if (arg == "--show-trace")
-            settings.showTrace = true;
-        else if (arg == "--no-gc-warning")
-            gcWarning = false;
-        else if (arg == "--option") {
-            ++i; if (i == args.end()) throw UsageError("‘--option’ requires two arguments");
-            string name = *i;
-            ++i; if (i == args.end()) throw UsageError("‘--option’ requires two arguments");
-            string value = *i;
-            settings.set(name, value);
-        }
-        else {
-            if (!parseArg(i, args.end()))
-                throw UsageError(format("unrecognised option ‘%1%’") % *i);
-        }
-    }
-
+    LegacyArgs(baseNameOf(argv[0]), parseArg).parseCmdline(argvToStrings(argc, argv));
     settings.update();
 }
 
@@ -255,7 +252,6 @@ void printVersion(const string & programName)
         std::cout << "Configuration file: " << settings.nixConfDir + "/nix.conf" << "\n";
         std::cout << "Store directory: " << settings.nixStore << "\n";
         std::cout << "State directory: " << settings.nixStateDir << "\n";
-        std::cout << "Database directory: " << settings.nixDBPath << "\n";
     }
     throw Exit();
 }
@@ -280,27 +276,26 @@ int handleExceptions(const string & programName, std::function<void()> fun)
                condition is discharged before we reach printMsg()
                below, since otherwise it will throw an (uncaught)
                exception. */
-            blockInt = 1; /* ignore further SIGINTs */
-            _isInterrupted = 0;
+            interruptThrown = true;
             throw;
         }
     } catch (Exit & e) {
         return e.status;
     } catch (UsageError & e) {
-        printMsg(lvlError,
+        printError(
             format(error + "%1%\nTry ‘%2% --help’ for more information.")
             % e.what() % programName);
         return 1;
     } catch (BaseError & e) {
-        printMsg(lvlError, format(error + "%1%%2%") % (settings.showTrace ? e.prefix() : "") % e.msg());
+        printError(format(error + "%1%%2%") % (settings.showTrace ? e.prefix() : "") % e.msg());
         if (e.prefix() != "" && !settings.showTrace)
-            printMsg(lvlError, "(use ‘--show-trace’ to show detailed location information)");
+            printError("(use ‘--show-trace’ to show detailed location information)");
         return e.status;
     } catch (std::bad_alloc & e) {
-        printMsg(lvlError, error + "out of memory");
+        printError(error + "out of memory");
         return 1;
     } catch (std::exception & e) {
-        printMsg(lvlError, error + e.what());
+        printError(error + e.what());
         return 1;
     }
 
@@ -329,7 +324,7 @@ RunPager::RunPager()
     toPager.create();
 
     pid = startProcess([&]() {
-        if (dup2(toPager.readSide, STDIN_FILENO) == -1)
+        if (dup2(toPager.readSide.get(), STDIN_FILENO) == -1)
             throw SysError("dupping stdin");
         if (!getenv("LESS"))
             setenv("LESS", "FRSXMK", 1);
@@ -341,7 +336,7 @@ RunPager::RunPager()
         throw SysError(format("executing ‘%1%’") % pager);
     });
 
-    if (dup2(toPager.writeSide, STDOUT_FILENO) == -1)
+    if (dup2(toPager.writeSide.get(), STDOUT_FILENO) == -1)
         throw SysError("dupping stdout");
 }
 

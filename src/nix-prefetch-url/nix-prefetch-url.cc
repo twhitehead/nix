@@ -91,8 +91,8 @@ int main(int argc, char * * argv)
         if (args.size() > 2)
             throw UsageError("too many arguments");
 
-        store = openStore();
-        EvalState state(searchPath);
+        auto store = openStore();
+        EvalState state(searchPath, store);
 
         Bindings & autoArgs(*evalAutoArgs(state, autoArgs_));
 
@@ -122,7 +122,7 @@ int main(int argc, char * * argv)
             /* Extract the hash mode. */
             attr = v.attrs->find(state.symbols.create("outputHashMode"));
             if (attr == v.attrs->end())
-                printMsg(lvlInfo, "warning: this does not look like a fetchurl call");
+                printInfo("warning: this does not look like a fetchurl call");
             else
                 unpack = state.forceString(*attr->value) == "recursive";
 
@@ -146,7 +146,7 @@ int main(int argc, char * * argv)
         Path storePath;
         if (args.size() == 2) {
             expectedHash = parseHash16or32(ht, args[1]);
-            storePath = makeFixedOutputPath(unpack, ht, expectedHash, name);
+            storePath = store->makeFixedOutputPath(unpack, expectedHash, name);
             if (store->isValidPath(storePath))
                 hash = expectedHash;
             else
@@ -158,15 +158,15 @@ int main(int argc, char * * argv)
             auto actualUri = resolveMirrorUri(state, uri);
 
             /* Download the file. */
-            auto result = downloadFile(actualUri, DownloadOptions());
+            auto result = getDownloader()->download(DownloadRequest(actualUri));
 
             AutoDelete tmpDir(createTempDir(), true);
             Path tmpFile = (Path) tmpDir + "/tmp";
-            writeFile(tmpFile, result.data);
+            writeFile(tmpFile, *result.data);
 
             /* Optionally unpack the file. */
             if (unpack) {
-                printMsg(lvlInfo, "unpacking...");
+                printInfo("unpacking...");
                 Path unpacked = (Path) tmpDir + "/unpacked";
                 createDirs(unpacked);
                 if (hasSuffix(baseNameOf(uri), ".zip"))
@@ -186,7 +186,7 @@ int main(int argc, char * * argv)
 
             /* FIXME: inefficient; addToStore() will also hash
                this. */
-            hash = unpack ? hashPath(ht, tmpFile).first : hashString(ht, result.data);
+            hash = unpack ? hashPath(ht, tmpFile).first : hashString(ht, *result.data);
 
             if (expectedHash != Hash(ht) && expectedHash != hash)
                 throw Error(format("hash mismatch for ‘%1%’") % uri);
@@ -197,11 +197,11 @@ int main(int argc, char * * argv)
                into the Nix store. */
             storePath = store->addToStore(name, tmpFile, unpack, ht);
 
-            assert(storePath == makeFixedOutputPath(unpack, ht, hash, name));
+            assert(storePath == store->makeFixedOutputPath(unpack, hash, name));
         }
 
         if (!printPath)
-            printMsg(lvlInfo, format("path is ‘%1%’") % storePath);
+            printInfo(format("path is ‘%1%’") % storePath);
 
         std::cout << printHash16or32(hash) << std::endl;
         if (printPath)

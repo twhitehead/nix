@@ -8,18 +8,9 @@
 namespace nix {
 
 
-BufferedSink::~BufferedSink()
-{
-    /* We can't call flush() here, because C++ for some insane reason
-       doesn't allow you to call virtual methods from a destructor. */
-    assert(!bufPos);
-    delete[] buffer;
-}
-
-
 void BufferedSink::operator () (const unsigned char * data, size_t len)
 {
-    if (!buffer) buffer = new unsigned char[bufSize];
+    if (!buffer) buffer = decltype(buffer)(new unsigned char[bufSize]);
 
     while (len) {
         /* Optimisation: bypass the buffer if the data exceeds the
@@ -32,7 +23,7 @@ void BufferedSink::operator () (const unsigned char * data, size_t len)
         /* Otherwise, copy the bytes to the buffer.  Flush the buffer
            when it's full. */
         size_t n = bufPos + len > bufSize ? bufSize - bufPos : len;
-        memcpy(buffer + bufPos, data, n);
+        memcpy(buffer.get() + bufPos, data, n);
         data += n; bufPos += n; len -= n;
         if (bufPos == bufSize) flush();
     }
@@ -44,7 +35,7 @@ void BufferedSink::flush()
     if (bufPos == 0) return;
     size_t n = bufPos;
     bufPos = 0; // don't trigger the assert() in ~BufferedSink()
-    write(buffer, n);
+    write(buffer.get(), n);
 }
 
 
@@ -58,21 +49,31 @@ size_t threshold = 256 * 1024 * 1024;
 
 static void warnLargeDump()
 {
-    printMsg(lvlError, "warning: dumping very large path (> 256 MiB); this may run out of memory");
+    printError("warning: dumping very large path (> 256 MiB); this may run out of memory");
 }
 
 
 void FdSink::write(const unsigned char * data, size_t len)
 {
+    written += len;
     static bool warned = false;
     if (warn && !warned) {
-        written += len;
         if (written > threshold) {
             warnLargeDump();
             warned = true;
         }
     }
-    writeFull(fd, data, len);
+    try {
+        writeFull(fd, data, len);
+    } catch (SysError & e) {
+        _good = true;
+    }
+}
+
+
+bool FdSink::good()
+{
+    return _good;
 }
 
 
@@ -85,21 +86,15 @@ void Source::operator () (unsigned char * data, size_t len)
 }
 
 
-BufferedSource::~BufferedSource()
-{
-    delete[] buffer;
-}
-
-
 size_t BufferedSource::read(unsigned char * data, size_t len)
 {
-    if (!buffer) buffer = new unsigned char[bufSize];
+    if (!buffer) buffer = decltype(buffer)(new unsigned char[bufSize]);
 
-    if (!bufPosIn) bufPosIn = readUnbuffered(buffer, bufSize);
+    if (!bufPosIn) bufPosIn = readUnbuffered(buffer.get(), bufSize);
 
     /* Copy out the data in the buffer. */
     size_t n = len > bufPosIn - bufPosOut ? bufPosIn - bufPosOut : len;
-    memcpy(data, buffer + bufPosOut, n);
+    memcpy(data, buffer.get() + bufPosOut, n);
     bufPosOut += n;
     if (bufPosIn == bufPosOut) bufPosIn = bufPosOut = 0;
     return n;
@@ -119,9 +114,16 @@ size_t FdSource::readUnbuffered(unsigned char * data, size_t len)
         checkInterrupt();
         n = ::read(fd, (char *) data, bufSize);
     } while (n == -1 && errno == EINTR);
-    if (n == -1) throw SysError("reading from file");
-    if (n == 0) throw EndOfFile("unexpected end-of-file");
+    if (n == -1) { _good = false; throw SysError("reading from file"); }
+    if (n == 0) { _good = false; throw EndOfFile("unexpected end-of-file"); }
+    read += n;
     return n;
+}
+
+
+bool FdSource::good()
+{
+    return _good;
 }
 
 
@@ -271,11 +273,11 @@ template PathSet readStrings(Source & source);
 void StringSink::operator () (const unsigned char * data, size_t len)
 {
     static bool warned = false;
-    if (!warned && s.size() > threshold) {
+    if (!warned && s->size() > threshold) {
         warnLargeDump();
         warned = true;
     }
-    s.append((const char *) data, len);
+    s->append((const char *) data, len);
 }
 
 

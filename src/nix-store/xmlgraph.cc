@@ -33,34 +33,29 @@ static string makeNode(const string & id)
 }
 
 
-void printXmlGraph(const PathSet & roots)
+void printXmlGraph(ref<Store> store, const PathSet & roots)
 {
     PathSet workList(roots);
     PathSet doneSet;
 
     cout << "<?xml version='1.0' encoding='utf-8'?>\n"
-	 << "<nix>\n";
+         << "<nix>\n";
 
     while (!workList.empty()) {
-	Path path = *(workList.begin());
-	workList.erase(path);
+        Path path = *(workList.begin());
+        workList.erase(path);
 
-	if (doneSet.find(path) != doneSet.end()) continue;
-	doneSet.insert(path);
+        if (doneSet.find(path) != doneSet.end()) continue;
+        doneSet.insert(path);
 
-	cout << makeNode(path);
+        cout << makeNode(path);
 
-	PathSet references;
-	store->queryReferences(path, references);
-
-	for (PathSet::iterator i = references.begin();
-	     i != references.end(); ++i)
-	{
-	    if (*i != path) {
-		workList.insert(*i);
-		cout << makeEdge(*i, path);
-	    }
-	}
+        for (auto & p : store->queryPathInfo(path)->references) {
+            if (p != path) {
+                workList.insert(p);
+                cout << makeEdge(p, path);
+            }
+        }
 
     }
 

@@ -9,7 +9,6 @@
 #include "util.hh"
 #include "store-api.hh"
 #include "common-opts.hh"
-#include "misc.hh"
 
 #include <map>
 #include <iostream>
@@ -20,7 +19,7 @@ using namespace nix;
 
 static Expr * parseStdin(EvalState & state)
 {
-    startNest(nest, lvlTalkative, format("parsing standard input"));
+    Activity act(*logger, lvlTalkative, format("parsing standard input"));
     return state.parseExprFromString(drainFD(0), absPath("."));
 }
 
@@ -80,7 +79,9 @@ void processExpr(EvalState & state, const Strings & attrPaths,
                 else {
                     Path rootName = gcRoot;
                     if (++rootNr > 1) rootName += "-" + std::to_string(rootNr);
-                    drvPath = addPermRoot(*store, drvPath, rootName, indirectRoot);
+                    auto store2 = state.store.dynamic_pointer_cast<LocalFSStore>();
+                    if (store2)
+                        drvPath = store2->addPermRoot(drvPath, rootName, indirectRoot);
                 }
                 std::cout << format("%1%%2%\n") % drvPath % (outputName != "out" ? "!" + outputName : "");
             }
@@ -158,9 +159,9 @@ int main(int argc, char * * argv)
         if (evalOnly && !wantsReadWrite)
             settings.readOnlyMode = true;
 
-        store = openStore();
+        auto store = openStore();
 
-        EvalState state(searchPath);
+        EvalState state(searchPath, store);
         state.repair = repair;
 
         Bindings & autoArgs(*evalAutoArgs(state, autoArgs_));

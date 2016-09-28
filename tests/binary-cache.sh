@@ -1,63 +1,77 @@
 source common.sh
 
 clearStore
-clearManifests
 clearCache
 
 # Create the binary cache.
 outPath=$(nix-build dependencies.nix --no-out-link)
 
-nix-push --dest $cacheDir $outPath
+nix copy --recursive --to file://$cacheDir $outPath
 
 
-# By default, a binary cache doesn't support "nix-env -qas", but does
-# support installation.
-clearStore
-rm -f $NIX_STATE_DIR/binary-cache*
+basicTests() {
 
-export _NIX_CACHE_FILE_URLS=1
+    # By default, a binary cache doesn't support "nix-env -qas", but does
+    # support installation.
+    clearStore
+    clearCacheCache
 
-nix-env --option binary-caches "file://$cacheDir" -f dependencies.nix -qas \* | grep -- "---"
+    nix-env --option binary-caches "file://$cacheDir" -f dependencies.nix -qas \* | grep -- "---"
 
-nix-store --option binary-caches "file://$cacheDir" -r $outPath
+    nix-store --option binary-caches "file://$cacheDir" -r $outPath
 
-[ -x $outPath/program ]
+    [ -x $outPath/program ]
 
 
-# But with the right configuration, "nix-env -qas" should also work.
-clearStore
-rm -f $NIX_STATE_DIR/binary-cache*
-echo "WantMassQuery: 1" >> $cacheDir/nix-cache-info
+    # But with the right configuration, "nix-env -qas" should also work.
+    clearStore
+    clearCacheCache
+    echo "WantMassQuery: 1" >> $cacheDir/nix-cache-info
 
-nix-env --option binary-caches "file://$cacheDir" -f dependencies.nix -qas \* | grep -- "--S"
+    nix-env --option binary-caches "file://$cacheDir" -f dependencies.nix -qas \* | grep -- "--S"
+    nix-env --option binary-caches "file://$cacheDir" -f dependencies.nix -qas \* | grep -- "--S"
 
-x=$(nix-env -f dependencies.nix -qas \* --prebuilt-only)
-[ -z "$x" ]
+    x=$(nix-env -f dependencies.nix -qas \* --prebuilt-only)
+    [ -z "$x" ]
 
-nix-store --option binary-caches "file://$cacheDir" -r $outPath
+    nix-store --option binary-caches "file://$cacheDir" -r $outPath
 
-nix-store --check-validity $outPath
-nix-store -qR $outPath | grep input-2
+    nix-store --check-validity $outPath
+    nix-store -qR $outPath | grep input-2
+
+    echo "WantMassQuery: 0" >> $cacheDir/nix-cache-info
+}
+
+
+# Test LocalBinaryCacheStore.
+basicTests
+
+
+# Test HttpBinaryCacheStore.
+export _NIX_FORCE_HTTP_BINARY_CACHE_STORE=1
+basicTests
+
+
+unset _NIX_FORCE_HTTP_BINARY_CACHE_STORE
 
 
 # Test whether Nix notices if the NAR doesn't match the hash in the NAR info.
 clearStore
 
-nar=$(ls $cacheDir/*.nar.xz | head -n1)
+nar=$(ls $cacheDir/nar/*.nar.xz | head -n1)
 mv $nar $nar.good
 mkdir -p $TEST_ROOT/empty
 nix-store --dump $TEST_ROOT/empty | xz > $nar
 
 nix-build --option binary-caches "file://$cacheDir" dependencies.nix -o $TEST_ROOT/result 2>&1 | tee $TEST_ROOT/log
-grep -q "hash mismatch in downloaded path" $TEST_ROOT/log
+grep -q "hash mismatch" $TEST_ROOT/log
 
 mv $nar.good $nar
 
 
 # Test whether this unsigned cache is rejected if the user requires signed caches.
 clearStore
-
-rm -f $NIX_STATE_DIR/binary-cache*
+clearCacheCache
 
 if nix-store --option binary-caches "file://$cacheDir" --option signed-binary-caches '*' -r $outPath; then
     echo "unsigned binary cache incorrectly accepted"
@@ -86,7 +100,7 @@ clearStore
 rm $(grep -l "StorePath:.*dependencies-input-2" $cacheDir/*.narinfo)
 
 nix-build --option binary-caches "file://$cacheDir" dependencies.nix -o $TEST_ROOT/result 2>&1 | tee $TEST_ROOT/log
-grep -q "Downloading" $TEST_ROOT/log
+grep -q "fetching path" $TEST_ROOT/log
 
 
 if [ -n "$HAVE_SODIUM" ]; then
@@ -103,21 +117,19 @@ badKey="$(cat $TEST_ROOT/pk2)"
 res=($(nix-store --generate-binary-cache-key foo.nixos.org-1 $TEST_ROOT/sk3 $TEST_ROOT/pk3))
 otherKey="$(cat $TEST_ROOT/pk3)"
 
-nix-push --dest $cacheDir --key-file $TEST_ROOT/sk1 $outPath
+nix copy --recursive --to file://$cacheDir?secret-key=$TEST_ROOT/sk1 $outPath
 
 
 # Downloading should fail if we don't provide a key.
 clearStore
-
-rm -f $NIX_STATE_DIR/binary-cache*
+clearCacheCache
 
 (! nix-store -r $outPath --option binary-caches "file://$cacheDir" --option signed-binary-caches '*' )
 
 
 # And it should fail if we provide an incorrect key.
 clearStore
-
-rm -f $NIX_STATE_DIR/binary-cache*
+clearCacheCache
 
 (! nix-store -r $outPath --option binary-caches "file://$cacheDir" --option signed-binary-caches '*' --option binary-cache-public-keys "$badKey")
 
@@ -129,13 +141,21 @@ nix-store -r $outPath --option binary-caches "file://$cacheDir" --option signed-
 # It should fail if we corrupt the .narinfo.
 clearStore
 
-for i in $cacheDir/*.narinfo; do
+cacheDir2=$TEST_ROOT/binary-cache-2
+rm -rf $cacheDir2
+cp -r $cacheDir $cacheDir2
+
+for i in $cacheDir2/*.narinfo; do
     grep -v References $i > $i.tmp
     mv $i.tmp $i
 done
 
-rm -f $NIX_STATE_DIR/binary-cache*
+clearCacheCache
 
-(! nix-store -r $outPath --option binary-caches "file://$cacheDir" --option signed-binary-caches '*' --option binary-cache-public-keys "$publicKey")
+(! nix-store -r $outPath --option binary-caches "file://$cacheDir2" --option signed-binary-caches '*' --option binary-cache-public-keys "$publicKey")
+
+# If we provide a bad and a good binary cache, it should succeed.
+
+nix-store -r $outPath --option binary-caches "file://$cacheDir2 file://$cacheDir" --option signed-binary-caches '*' --option binary-cache-public-keys "$publicKey"
 
 fi # HAVE_LIBSODIUM

@@ -8,14 +8,11 @@
 
 #include <map>
 
-#if HAVE_BOEHMGC
-#include <gc/gc_allocator.h>
-#endif
-
 
 namespace nix {
 
 
+class Store;
 class EvalState;
 
 
@@ -25,9 +22,9 @@ typedef void (* PrimOpFun) (EvalState & state, const Pos & pos, Value * * args, 
 struct PrimOp
 {
     PrimOpFun fun;
-    unsigned int arity;
+    size_t arity;
     Symbol name;
-    PrimOp(PrimOpFun fun, unsigned int arity, Symbol name)
+    PrimOp(PrimOpFun fun, size_t arity, Symbol name)
         : fun(fun), arity(arity), name(name) { }
 };
 
@@ -42,7 +39,7 @@ struct Env
 };
 
 
-void mkString(Value & v, const string & s, const PathSet & context = PathSet());
+Value & mkString(Value & v, const string & s, const PathSet & context = PathSet());
 
 void copyContext(const Value & v, PathSet & context);
 
@@ -55,7 +52,8 @@ typedef std::map<Path, Path> SrcToStore;
 std::ostream & operator << (std::ostream & str, const Value & v);
 
 
-typedef list<std::pair<string, Path> > SearchPath;
+typedef std::pair<std::string, std::string> SearchPathElem;
+typedef std::list<SearchPathElem> SearchPath;
 
 
 /* Initialise the Boehm GC, if applicable. */
@@ -69,7 +67,8 @@ public:
 
     const Symbol sWith, sOutPath, sDrvPath, sType, sMeta, sName, sValue,
         sSystem, sOverrides, sOutputs, sOutputName, sIgnoreNulls,
-        sFile, sLine, sColumn, sFunctor, sToString;
+        sFile, sLine, sColumn, sFunctor, sToString,
+        sRight, sWrong;
     Symbol sDerivationNix;
 
     /* If set, force copying files to the Nix store even if they
@@ -81,6 +80,8 @@ public:
     bool restricted;
 
     Value vEmptySet;
+
+    const ref<Store> store;
 
 private:
     SrcToStore srcToStore;
@@ -95,12 +96,16 @@ private:
 
     SearchPath searchPath;
 
+    std::map<std::string, std::pair<bool, std::string>> searchPathResolved;
+
 public:
 
-    EvalState(const Strings & _searchPath);
+    EvalState(const Strings & _searchPath, ref<Store> store);
     ~EvalState();
 
-    void addToSearchPath(const string & s, bool warn = false);
+    void addToSearchPath(const string & s);
+
+    SearchPath getSearchPath() { return searchPath; }
 
     Path checkSourcePath(const Path & path);
 
@@ -121,6 +126,9 @@ public:
     /* Look up a file in the search path. */
     Path findFile(const string & path);
     Path findFile(SearchPath & searchPath, const string & path, const Pos & pos = noPos);
+
+    /* If the specified search path element is a URI, download it. */
+    std::pair<bool, std::string> resolveSearchPathElem(const SearchPathElem & elem);
 
     /* Evaluate an expression to normal form, storing the result in
        value `v'. */
@@ -144,7 +152,8 @@ public:
 
     /* Force `v', and then verify that it has the expected type. */
     NixInt forceInt(Value & v, const Pos & pos);
-    bool forceBool(Value & v);
+    NixFloat forceFloat(Value & v, const Pos & pos);
+    bool forceBool(Value & v, const Pos & pos);
     inline void forceAttrs(Value & v);
     inline void forceAttrs(Value & v, const Pos & pos);
     inline void forceList(Value & v);
@@ -194,7 +203,7 @@ private:
 
 public:
 
-    void getBuiltin(const string & name, Value & v);
+    Value & getBuiltin(const string & name);
 
 private:
 
@@ -239,6 +248,8 @@ public:
 
     /* Print statistics. */
     void printStats();
+
+    void realiseContext(const PathSet & context);
 
 private:
 
@@ -289,8 +300,5 @@ struct InvalidPathError : EvalError
     ~InvalidPathError() throw () { };
 #endif
 };
-
-/* Realise all paths in `context' */
-void realiseContext(const PathSet & context);
 
 }

@@ -5,16 +5,17 @@ makefiles = \
   src/libstore/local.mk \
   src/libmain/local.mk \
   src/libexpr/local.mk \
-  src/nix-hash/local.mk \
+  src/nix/local.mk \
   src/nix-store/local.mk \
   src/nix-instantiate/local.mk \
   src/nix-env/local.mk \
   src/nix-daemon/local.mk \
   src/nix-collect-garbage/local.mk \
-  src/download-via-ssh/local.mk \
-  src/nix-log2xml/local.mk \
   src/nix-prefetch-url/local.mk \
-  src/bsdiff-4.3/local.mk \
+  src/buildenv/local.mk \
+  src/resolve-system-dependencies/local.mk \
+  src/nix-channel/local.mk \
+  src/nix-build/local.mk \
   perl/local.mk \
   scripts/local.mk \
   corepkgs/local.mk \
@@ -24,8 +25,9 @@ makefiles = \
   misc/emacs/local.mk \
   doc/manual/local.mk \
   tests/local.mk
+  #src/download-via-ssh/local.mk \
 
-GLOBAL_CXXFLAGS += -std=c++0x -g -Wall
+GLOBAL_CXXFLAGS += -std=c++11 -g -Wall
 
 -include Makefile.config
 

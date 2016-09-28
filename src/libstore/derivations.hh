@@ -29,7 +29,7 @@ struct DerivationOutput
         this->hashAlgo = hashAlgo;
         this->hash = hash;
     }
-    void parseHashInfo(bool & recursive, HashType & hashType, Hash & hash) const;
+    void parseHashInfo(bool & recursive, Hash & hash) const;
 };
 
 typedef std::map<string, DerivationOutput> DerivationOutputs;
@@ -50,40 +50,56 @@ struct BasicDerivation
     StringPairs env;
 
     virtual ~BasicDerivation() { };
+
+    /* Return the path corresponding to the output identifier `id' in
+       the given derivation. */
+    Path findOutput(const string & id) const;
+
+    bool willBuildLocally() const;
+
+    bool substitutesAllowed() const;
+
+    bool isBuiltin() const;
+
+    bool canBuildLocally() const;
+
+    /* Return true iff this is a fixed-output derivation. */
+    bool isFixedOutput() const;
+
+    /* Return the output paths of a derivation. */
+    PathSet outputPaths() const;
+
 };
 
 struct Derivation : BasicDerivation
 {
     DerivationInputs inputDrvs; /* inputs that are sub-derivations */
+
+    /* Print a derivation. */
+    std::string unparse() const;
 };
 
 
-class StoreAPI;
+class Store;
 
 
 /* Write a derivation to the Nix store, and return its path. */
-Path writeDerivation(StoreAPI & store,
+Path writeDerivation(ref<Store> store,
     const Derivation & drv, const string & name, bool repair = false);
 
 /* Read a derivation from a file. */
 Derivation readDerivation(const Path & drvPath);
 
-/* Print a derivation. */
-string unparseDerivation(const Derivation & drv);
-
-/* Check whether a file name ends with the extensions for
+/* Check whether a file name ends with the extension for
    derivations. */
 bool isDerivation(const string & fileName);
 
-/* Return true iff this is a fixed-output derivation. */
-bool isFixedOutputDrv(const Derivation & drv);
-
-Hash hashDerivationModulo(StoreAPI & store, Derivation drv);
+Hash hashDerivationModulo(Store & store, Derivation drv);
 
 /* Memoisation of hashDerivationModulo(). */
 typedef std::map<Path, Hash> DrvHashes;
 
-extern DrvHashes drvHashes;
+extern DrvHashes drvHashes; // FIXME: global, not thread-safe
 
 /* Split a string specifying a derivation and a set of outputs
    (/nix/store/hash-foo!out1,out2,...) into the derivation path and
@@ -95,12 +111,12 @@ Path makeDrvPathWithOutputs(const Path & drvPath, const std::set<string> & outpu
 
 bool wantOutput(const string & output, const std::set<string> & wanted);
 
-PathSet outputPaths(const BasicDerivation & drv);
-
 struct Source;
 struct Sink;
 
-Source & operator >> (Source & in, BasicDerivation & drv);
+Source & readDerivation(Source & in, Store & store, BasicDerivation & drv);
 Sink & operator << (Sink & out, const BasicDerivation & drv);
+
+std::string hashPlaceholder(const std::string & outputName);
 
 }

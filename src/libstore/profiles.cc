@@ -74,7 +74,7 @@ static void makeName(const Path & profile, unsigned int num,
 }
 
 
-Path createGeneration(Path profile, Path outPath)
+Path createGeneration(ref<LocalFSStore> store, Path profile, Path outPath)
 {
     /* The new generation number should be higher than old the
        previous ones. */
@@ -108,7 +108,7 @@ Path createGeneration(Path profile, Path outPath)
        user environment etc. we've just built. */
     Path generation;
     makeName(profile, num + 1, generation);
-    addPermRoot(*store, outPath, generation, false, true);
+    store->addPermRoot(outPath, generation, false, true);
 
     return generation;
 }
@@ -132,9 +132,9 @@ void deleteGeneration(const Path & profile, unsigned int gen)
 static void deleteGeneration2(const Path & profile, unsigned int gen, bool dryRun)
 {
     if (dryRun)
-        printMsg(lvlInfo, format("would remove generation %1%") % gen);
+        printInfo(format("would remove generation %1%") % gen);
     else {
-        printMsg(lvlInfo, format("removing generation %1%") % gen);
+        printInfo(format("removing generation %1%") % gen);
         deleteGeneration(profile, gen);
     }
 }
@@ -222,8 +222,7 @@ void switchLink(Path link, Path target)
 
 void lockProfile(PathLocks & lock, const Path & profile)
 {
-    lock.lockPaths(singleton<PathSet>(profile),
-        (format("waiting for lock on profile ‘%1%’") % profile).str());
+    lock.lockPaths({profile}, (format("waiting for lock on profile ‘%1%’") % profile).str());
     lock.setDeletion(true);
 }
 

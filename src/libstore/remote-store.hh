@@ -1,5 +1,6 @@
 #pragma once
 
+#include <limits>
 #include <string>
 
 #include "store-api.hh"
@@ -12,33 +13,32 @@ class Pipe;
 class Pid;
 struct FdSink;
 struct FdSource;
+template<typename T> class Pool;
 
 
-class RemoteStore : public StoreAPI
+/* FIXME: RemoteStore is a misnomer - should be something like
+   DaemonStore. */
+class RemoteStore : public LocalFSStore
 {
 public:
 
-    RemoteStore();
-
-    ~RemoteStore();
+    RemoteStore(const Params & params, size_t maxConnections = std::numeric_limits<size_t>::max());
 
     /* Implementations of abstract store API methods. */
 
-    bool isValidPath(const Path & path) override;
+    std::string getUri() override;
+
+    bool isValidPathUncached(const Path & path) override;
 
     PathSet queryValidPaths(const PathSet & paths) override;
 
     PathSet queryAllValidPaths() override;
 
-    ValidPathInfo queryPathInfo(const Path & path) override;
-
-    Hash queryPathHash(const Path & path) override;
-
-    void queryReferences(const Path & path, PathSet & references) override;
+    void queryPathInfoUncached(const Path & path,
+        std::function<void(std::shared_ptr<ValidPathInfo>)> success,
+        std::function<void(std::exception_ptr exc)> failure) override;
 
     void queryReferrers(const Path & path, PathSet & referrers) override;
-
-    Path queryDeriver(const Path & path) override;
 
     PathSet queryValidDerivers(const Path & path) override;
 
@@ -53,17 +53,15 @@ public:
     void querySubstitutablePathInfos(const PathSet & paths,
         SubstitutablePathInfos & infos) override;
 
+    void addToStore(const ValidPathInfo & info, const std::string & nar,
+        bool repair, bool dontCheckSigs) override;
+
     Path addToStore(const string & name, const Path & srcPath,
         bool recursive = true, HashType hashAlgo = htSHA256,
         PathFilter & filter = defaultPathFilter, bool repair = false) override;
 
     Path addTextToStore(const string & name, const string & s,
         const PathSet & references, bool repair = false) override;
-
-    void exportPath(const Path & path, bool sign,
-        Sink & sink) override;
-
-    Paths importPaths(bool requireSignature, Source & source) override;
 
     void buildPaths(const PathSet & paths, BuildMode buildMode) override;
 
@@ -82,29 +80,33 @@ public:
 
     void collectGarbage(const GCOptions & options, GCResults & results) override;
 
-    PathSet queryFailedPaths() override;
-
-    void clearFailedPaths(const PathSet & paths) override;
-
     void optimiseStore() override;
 
     bool verifyStore(bool checkContents, bool repair) override;
 
+    void addSignatures(const Path & storePath, const StringSet & sigs) override;
+
 private:
-    AutoCloseFD fdSocket;
-    FdSink to;
-    FdSource from;
-    unsigned int daemonVersion;
-    bool initialised;
 
-    void openConnection(bool reserveSpace = true);
+    struct Connection
+    {
+        AutoCloseFD fd;
+        FdSink to;
+        FdSource from;
+        unsigned int daemonVersion;
 
-    void processStderr(Sink * sink = 0, Source * source = 0);
+        ~Connection();
 
-    void connectToDaemonUNIX();
-    void connectToDaemonINET(const string & remoteAddress);
+        void processStderr(Sink * sink = 0, Source * source = 0);
+    };
 
-    void setOptions();
+    ref<Pool<Connection>> connections;
+
+    ref<Connection> openConnection();
+    ref<Connection> connectToDaemonUNIX();
+    ref<Connection> connectToDaemonINET(const string & remoteAddress);
+
+    void setOptions(ref<Connection> conn);
 };
 
 

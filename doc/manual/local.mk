@@ -1,3 +1,6 @@
+
+ifeq ($(doc_generate),yes)
+
 XSLTPROC = $(xsltproc) --nonet $(xmlflags) \
   --param section.autolabel 1 \
   --param section.label.includes.component.label 1 \
@@ -10,7 +13,7 @@ XSLTPROC = $(xsltproc) --nonet $(xmlflags) \
   --stringparam generate.toc "book toc" \
   --param keep.relative.image.uris 0
 
-docbookxsl = http://docbook.sourceforge.net/release/xsl-ns/1.78.1
+docbookxsl = http://docbook.sourceforge.net/release/xsl-ns/current
 docbookrng = http://docbook.org/xml/5.0/rng/docbook.rng
 
 MANUAL_SRCS := $(call rwildcard, $(d), *.xml)
@@ -39,9 +42,9 @@ dist-files += $(d)/manual.xmli $(d)/version.txt $(d)/manual.is-valid
 # Generate man pages.
 man-pages := $(foreach n, \
   nix-env.1 nix-build.1 nix-shell.1 nix-store.1 nix-instantiate.1 \
-  nix-collect-garbage.1 nix-push.1 nix-pull.1 \
+  nix-collect-garbage.1 \
   nix-prefetch-url.1 nix-channel.1 \
-  nix-install-package.1 nix-hash.1 nix-copy-closure.1 \
+  nix-hash.1 nix-copy-closure.1 \
   nix.conf.5 nix-daemon.8, \
   $(d)/$(n))
 
@@ -71,22 +74,14 @@ $(foreach file, $(wildcard $(d)/images/callouts/*.gif), $(eval $(call install-da
 
 $(eval $(call install-symlink, manual.html, $(docdir)/manual/index.html))
 
+
 all: $(d)/manual.html
+
+
 
 clean-files += $(d)/manual.html
 
 dist-files += $(d)/manual.html
 
 
-# Generate the PDF manual.
-$(d)/manual.pdf: $(d)/manual.xml $(MANUAL_SRCS) $(d)/manual.is-valid
-	$(trace-gen) if test "$(dblatex)" != ""; then \
-		cd doc/manual && $(XSLTPROC) --xinclude --stringparam profile.condition manual \
-		  $(docbookxsl)/profiling/profile.xsl manual.xml | \
-		  $(dblatex) -o $(notdir $@) $(dblatex_opts) -; \
-	else \
-		echo "Please install dblatex and rerun configure."; \
-		exit 1; \
-	fi
-
-clean-files += $(d)/manual.pdf
+endif

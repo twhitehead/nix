@@ -1,13 +1,15 @@
 source common.sh
 
-clearStore
+if [ -z "$storeCleared" ]; then
+    clearStore
+fi
+
 clearProfiles
 
 # Query installed: should be empty.
 test "$(nix-env -p $profiles/test -q '*' | wc -l)" -eq 0
 
-export HOME=$TEST_ROOT/home
-mkdir -p $HOME
+mkdir -p $TEST_HOME
 nix-env --switch-profile $profiles/test
 
 # Query available: should contain several.

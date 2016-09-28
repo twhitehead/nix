@@ -1,6 +1,7 @@
 #pragma once
 
 #include "types.hh"
+#include "logging.hh"
 
 #include <map>
 #include <sys/types.h>
@@ -50,9 +51,6 @@ struct Settings {
     /* The directory where state is stored. */
     Path nixStateDir;
 
-    /* The directory where we keep the SQLite database. */
-    Path nixDBPath;
-
     /* The directory where configuration files are stored. */
     Path nixConfDir;
 
@@ -77,8 +75,12 @@ struct Settings {
        instead. */
     bool tryFallback;
 
-    /* Verbosity level for build output. */
-    Verbosity buildVerbosity;
+    /* Whether to show build log output in real time. */
+    bool verboseBuild = true;
+
+    /* If verboseBuild is false, the number of lines of the tail of
+       the log to show if a build fails. */
+    size_t logLines = 10;
 
     /* Maximum number of parallel build jobs.  0 means unlimited. */
     unsigned int maxBuildJobs;
@@ -105,30 +107,9 @@ struct Settings {
        means infinity.  */
     time_t buildTimeout;
 
-    /* The substituters.  There are programs that can somehow realise
-       a store path without building, e.g., by downloading it or
-       copying it from a CD. */
-    Paths substituters;
-
     /* Whether to use build hooks (for distributed builds).  Sometimes
        users want to disable this from the command-line. */
     bool useBuildHook;
-
-    /* Whether buildDerivations() should print out lines on stderr in
-       a fixed format to allow its progress to be monitored.  Each
-       line starts with a "@".  The following are defined:
-
-       @ build-started <drvpath> <outpath> <system> <logfile>
-       @ build-failed <drvpath> <outpath> <exitcode> <error text>
-       @ build-succeeded <drvpath> <outpath>
-       @ substituter-started <outpath> <substituter>
-       @ substituter-failed <outpath> <exitcode> <error text>
-       @ substituter-succeeded <outpath>
-
-       Best combined with --no-build-output, otherwise stderr might
-       conceivably contain lines in this format printed by the
-       builders. */
-    bool printBuildTrace;
 
     /* Amount of reserved space for the garbage collector
        (/nix/var/nix/db/reserved). */
@@ -167,9 +148,6 @@ struct Settings {
     /* Maximum number of bytes a builder can write to stdout/stderr
        before being killed (0 means no limit). */
     unsigned long maxLogSize;
-
-    /* Whether to cache build failures. */
-    bool cacheFailure;
 
     /* How often (in seconds) to poll for locks. */
     unsigned int pollInterval;

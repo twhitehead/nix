@@ -1,14 +1,15 @@
-#include "globals.hh"
-#include "misc.hh"
 #include "archive.hh"
-#include "shared.hh"
+#include "derivations.hh"
 #include "dotgraph.hh"
-#include "xmlgraph.hh"
+#include "globals.hh"
 #include "local-store.hh"
-#include "util.hh"
-#include "serve-protocol.hh"
-#include "worker-protocol.hh"
 #include "monitor-fd.hh"
+#include "serve-protocol.hh"
+#include "shared.hh"
+#include "util.hh"
+#include "worker-protocol.hh"
+#include "xmlgraph.hh"
+#include "compression.hh"
 
 #include <iostream>
 #include <algorithm>
@@ -17,8 +18,6 @@
 #include <sys/types.h>
 #include <sys/stat.h>
 #include <fcntl.h>
-
-#include <bzlib.h>
 
 #if HAVE_SODIUM
 #include <sodium.h>
@@ -37,20 +36,21 @@ static Path gcRoot;
 static int rootNr = 0;
 static bool indirectRoot = false;
 static bool noOutput = false;
+static std::shared_ptr<Store> store;
 
 
-LocalStore & ensureLocalStore()
+ref<LocalStore> ensureLocalStore()
 {
-    LocalStore * store2(dynamic_cast<LocalStore *>(store.get()));
+    auto store2 = std::dynamic_pointer_cast<LocalStore>(store);
     if (!store2) throw Error("you don't have sufficient rights to use this command");
-    return *store2;
+    return ref<LocalStore>(store2);
 }
 
 
 static Path useDeriver(Path path)
 {
     if (isDerivation(path)) return path;
-    Path drvPath = store->queryDeriver(path);
+    Path drvPath = store->queryPathInfo(path)->deriver;
     if (drvPath == "")
         throw Error(format("deriver of path ‘%1%’ is not known") % path);
     return drvPath;
@@ -63,9 +63,11 @@ static PathSet realisePath(Path path, bool build = true)
 {
     DrvPathWithOutputs p = parseDrvPathWithOutputs(path);
 
+    auto store2 = std::dynamic_pointer_cast<LocalFSStore>(store);
+
     if (isDerivation(p.first)) {
-        if (build) store->buildPaths(singleton<PathSet>(path));
-        Derivation drv = derivationFromPath(*store, p.first);
+        if (build) store->buildPaths({path});
+        Derivation drv = store->derivationFromPath(p.first);
         rootNr++;
 
         if (p.second.empty())
@@ -77,13 +79,15 @@ static PathSet realisePath(Path path, bool build = true)
             if (i == drv.outputs.end())
                 throw Error(format("derivation ‘%1%’ does not have an output named ‘%2%’") % p.first % j);
             Path outPath = i->second.path;
-            if (gcRoot == "")
-                printGCWarning();
-            else {
-                Path rootName = gcRoot;
-                if (rootNr > 1) rootName += "-" + std::to_string(rootNr);
-                if (i->first != "out") rootName += "-" + i->first;
-                outPath = addPermRoot(*store, outPath, rootName, indirectRoot);
+            if (store2) {
+                if (gcRoot == "")
+                    printGCWarning();
+                else {
+                    Path rootName = gcRoot;
+                    if (rootNr > 1) rootName += "-" + std::to_string(rootNr);
+                    if (i->first != "out") rootName += "-" + i->first;
+                    outPath = store2->addPermRoot(outPath, rootName, indirectRoot);
+                }
             }
             outputs.insert(outPath);
         }
@@ -93,15 +97,17 @@ static PathSet realisePath(Path path, bool build = true)
     else {
         if (build) store->ensurePath(path);
         else if (!store->isValidPath(path)) throw Error(format("path ‘%1%’ does not exist and cannot be created") % path);
-        if (gcRoot == "")
-            printGCWarning();
-        else {
-            Path rootName = gcRoot;
-            rootNr++;
-            if (rootNr > 1) rootName += "-" + std::to_string(rootNr);
-            path = addPermRoot(*store, path, rootName, indirectRoot);
+        if (store2) {
+            if (gcRoot == "")
+                printGCWarning();
+            else {
+                Path rootName = gcRoot;
+                rootNr++;
+                if (rootNr > 1) rootName += "-" + std::to_string(rootNr);
+                path = store2->addPermRoot(path, rootName, indirectRoot);
+            }
         }
-        return singleton<PathSet>(path);
+        return {path};
     }
 }
 
@@ -117,18 +123,19 @@ static void opRealise(Strings opFlags, Strings opArgs)
         if (i == "--dry-run") dryRun = true;
         else if (i == "--repair") buildMode = bmRepair;
         else if (i == "--check") buildMode = bmCheck;
+        else if (i == "--hash") buildMode = bmHash;
         else if (i == "--ignore-unknown") ignoreUnknown = true;
         else throw UsageError(format("unknown flag ‘%1%’") % i);
 
     Paths paths;
     for (auto & i : opArgs) {
         DrvPathWithOutputs p = parseDrvPathWithOutputs(i);
-        paths.push_back(makeDrvPathWithOutputs(followLinksToStorePath(p.first), p.second));
+        paths.push_back(makeDrvPathWithOutputs(store->followLinksToStorePath(p.first), p.second));
     }
 
     unsigned long long downloadSize, narSize;
     PathSet willBuild, willSubstitute, unknown;
-    queryMissing(*store, PathSet(paths.begin(), paths.end()),
+    store->queryMissing(PathSet(paths.begin(), paths.end()),
         willBuild, willSubstitute, unknown, downloadSize, narSize);
 
     if (ignoreUnknown) {
@@ -140,7 +147,7 @@ static void opRealise(Strings opFlags, Strings opArgs)
     }
 
     if (settings.get("print-missing", true))
-        printMissing(willBuild, willSubstitute, unknown, downloadSize, narSize);
+        printMissing(ref<Store>(store), willBuild, willSubstitute, unknown, downloadSize, narSize);
 
     if (dryRun) return;
 
@@ -206,8 +213,7 @@ static void opPrintFixedPath(Strings opFlags, Strings opArgs)
     string name = *i++;
 
     cout << format("%1%\n") %
-        makeFixedOutputPath(recursive, hashAlgo,
-            parseHash16or32(hashAlgo, hash), name);
+        store->makeFixedOutputPath(recursive, parseHash16or32(hashAlgo, hash), name);
 }
 
 
@@ -215,13 +221,13 @@ static PathSet maybeUseOutputs(const Path & storePath, bool useOutput, bool forc
 {
     if (forceRealise) realisePath(storePath);
     if (useOutput && isDerivation(storePath)) {
-        Derivation drv = derivationFromPath(*store, storePath);
+        Derivation drv = store->derivationFromPath(storePath);
         PathSet outputs;
         for (auto & i : drv.outputs)
             outputs.insert(i.second.path);
         return outputs;
     }
-    else return singleton<PathSet>(storePath);
+    else return {storePath};
 }
 
 
@@ -245,14 +251,13 @@ static void printTree(const Path & path,
 
     cout << format("%1%%2%\n") % firstPad % path;
 
-    PathSet references;
-    store->queryReferences(path, references);
+    auto references = store->queryPathInfo(path)->references;
 
     /* Topologically sort under the relation A < B iff A \in
        closure(B).  That is, if derivation A is an (possibly indirect)
        input of B, then A is printed first.  This has the effect of
        flattening the tree, preventing deeply nested structures.  */
-    Paths sorted = topoSortPaths(*store, references);
+    Paths sorted = store->topoSortPaths(references);
     reverse(sorted.begin(), sorted.end());
 
     for (auto i = sorted.begin(); i != sorted.end(); ++i) {
@@ -315,9 +320,9 @@ static void opQuery(Strings opFlags, Strings opArgs)
 
         case qOutputs: {
             for (auto & i : opArgs) {
-                i = followLinksToStorePath(i);
+                i = store->followLinksToStorePath(i);
                 if (forceRealise) realisePath(i);
-                Derivation drv = derivationFromPath(*store, i);
+                Derivation drv = store->derivationFromPath(i);
                 for (auto & j : drv.outputs)
                     cout << format("%1%\n") % j.second.path;
             }
@@ -330,15 +335,18 @@ static void opQuery(Strings opFlags, Strings opArgs)
         case qReferrersClosure: {
             PathSet paths;
             for (auto & i : opArgs) {
-                PathSet ps = maybeUseOutputs(followLinksToStorePath(i), useOutput, forceRealise);
+                PathSet ps = maybeUseOutputs(store->followLinksToStorePath(i), useOutput, forceRealise);
                 for (auto & j : ps) {
-                    if (query == qRequisites) computeFSClosure(*store, j, paths, false, includeOutputs);
-                    else if (query == qReferences) store->queryReferences(j, paths);
+                    if (query == qRequisites) store->computeFSClosure(j, paths, false, includeOutputs);
+                    else if (query == qReferences) {
+                        for (auto & p : store->queryPathInfo(j)->references)
+                            paths.insert(p);
+                    }
                     else if (query == qReferrers) store->queryReferrers(j, paths);
-                    else if (query == qReferrersClosure) computeFSClosure(*store, j, paths, true);
+                    else if (query == qReferrersClosure) store->computeFSClosure(j, paths, true);
                 }
             }
-            Paths sorted = topoSortPaths(*store, paths);
+            Paths sorted = store->topoSortPaths(paths);
             for (Paths::reverse_iterator i = sorted.rbegin();
                  i != sorted.rend(); ++i)
                 cout << format("%s\n") % *i;
@@ -347,7 +355,7 @@ static void opQuery(Strings opFlags, Strings opArgs)
 
         case qDeriver:
             for (auto & i : opArgs) {
-                Path deriver = store->queryDeriver(followLinksToStorePath(i));
+                Path deriver = store->queryPathInfo(store->followLinksToStorePath(i))->deriver;
                 cout << format("%1%\n") %
                     (deriver == "" ? "unknown-deriver" : deriver);
             }
@@ -355,8 +363,8 @@ static void opQuery(Strings opFlags, Strings opArgs)
 
         case qBinding:
             for (auto & i : opArgs) {
-                Path path = useDeriver(followLinksToStorePath(i));
-                Derivation drv = derivationFromPath(*store, path);
+                Path path = useDeriver(store->followLinksToStorePath(i));
+                Derivation drv = store->derivationFromPath(path);
                 StringPairs::iterator j = drv.env.find(bindingName);
                 if (j == drv.env.end())
                     throw Error(format("derivation ‘%1%’ has no environment binding named ‘%2%’")
@@ -368,14 +376,14 @@ static void opQuery(Strings opFlags, Strings opArgs)
         case qHash:
         case qSize:
             for (auto & i : opArgs) {
-                PathSet paths = maybeUseOutputs(followLinksToStorePath(i), useOutput, forceRealise);
+                PathSet paths = maybeUseOutputs(store->followLinksToStorePath(i), useOutput, forceRealise);
                 for (auto & j : paths) {
-                    ValidPathInfo info = store->queryPathInfo(j);
+                    auto info = store->queryPathInfo(j);
                     if (query == qHash) {
-                        assert(info.hash.type == htSHA256);
-                        cout << format("sha256:%1%\n") % printHash32(info.hash);
+                        assert(info->narHash.type == htSHA256);
+                        cout << format("sha256:%1%\n") % printHash32(info->narHash);
                     } else if (query == qSize)
-                        cout << format("%1%\n") % info.narSize;
+                        cout << format("%1%\n") % info->narSize;
                 }
             }
             break;
@@ -383,42 +391,42 @@ static void opQuery(Strings opFlags, Strings opArgs)
         case qTree: {
             PathSet done;
             for (auto & i : opArgs)
-                printTree(followLinksToStorePath(i), "", "", done);
+                printTree(store->followLinksToStorePath(i), "", "", done);
             break;
         }
 
         case qGraph: {
             PathSet roots;
             for (auto & i : opArgs) {
-                PathSet paths = maybeUseOutputs(followLinksToStorePath(i), useOutput, forceRealise);
+                PathSet paths = maybeUseOutputs(store->followLinksToStorePath(i), useOutput, forceRealise);
                 roots.insert(paths.begin(), paths.end());
             }
-            printDotGraph(roots);
+            printDotGraph(ref<Store>(store), roots);
             break;
         }
 
         case qXml: {
             PathSet roots;
             for (auto & i : opArgs) {
-                PathSet paths = maybeUseOutputs(followLinksToStorePath(i), useOutput, forceRealise);
+                PathSet paths = maybeUseOutputs(store->followLinksToStorePath(i), useOutput, forceRealise);
                 roots.insert(paths.begin(), paths.end());
             }
-            printXmlGraph(roots);
+            printXmlGraph(ref<Store>(store), roots);
             break;
         }
 
         case qResolve: {
             for (auto & i : opArgs)
-                cout << format("%1%\n") % followLinksToStorePath(i);
+                cout << format("%1%\n") % store->followLinksToStorePath(i);
             break;
         }
 
         case qRoots: {
             PathSet referrers;
             for (auto & i : opArgs) {
-                PathSet paths = maybeUseOutputs(followLinksToStorePath(i), useOutput, forceRealise);
+                PathSet paths = maybeUseOutputs(store->followLinksToStorePath(i), useOutput, forceRealise);
                 for (auto & j : paths)
-                    computeFSClosure(*store, j, referrers, true,
+                    store->computeFSClosure(j, referrers, true,
                         settings.gcKeepOutputs, settings.gcKeepDerivations);
             }
             Roots roots = store->findRoots();
@@ -449,7 +457,7 @@ static void opPrintEnv(Strings opFlags, Strings opArgs)
     if (opArgs.size() != 1) throw UsageError("‘--print-env’ requires one derivation store path");
 
     Path drvPath = opArgs.front();
-    Derivation drv = derivationFromPath(*store, drvPath);
+    Derivation drv = store->derivationFromPath(drvPath);
 
     /* Print each environment variable in the derivation in a format
        that can be sourced by the shell. */
@@ -475,8 +483,12 @@ static void opReadLog(Strings opFlags, Strings opArgs)
 
     RunPager pager;
 
+    // FIXME: move getting logs into Store.
+    auto store2 = std::dynamic_pointer_cast<LocalFSStore>(store);
+    if (!store2) throw Error(format("store ‘%s’ does not support reading logs") % store->getUri());
+
     for (auto & i : opArgs) {
-        Path path = useDeriver(followLinksToStorePath(i));
+        Path path = useDeriver(store->followLinksToStorePath(i));
 
         string baseName = baseNameOf(path);
         bool found = false;
@@ -485,8 +497,8 @@ static void opReadLog(Strings opFlags, Strings opArgs)
 
             Path logPath =
                 j == 0
-                ? (format("%1%/%2%/%3%/%4%") % settings.nixLogDir % drvsLogDir % string(baseName, 0, 2) % string(baseName, 2)).str()
-                : (format("%1%/%2%/%3%") % settings.nixLogDir % drvsLogDir % baseName).str();
+                ? (format("%1%/%2%/%3%/%4%") % store2->logDir % drvsLogDir % string(baseName, 0, 2) % string(baseName, 2)).str()
+                : (format("%1%/%2%/%3%") % store2->logDir % drvsLogDir % baseName).str();
             Path logBz2Path = logPath + ".bz2";
 
             if (pathExists(logPath)) {
@@ -498,21 +510,7 @@ static void opReadLog(Strings opFlags, Strings opArgs)
             }
 
             else if (pathExists(logBz2Path)) {
-                AutoCloseFD fd = open(logBz2Path.c_str(), O_RDONLY);
-                FILE * f = 0;
-                if (fd == -1 || (f = fdopen(fd.borrow(), "r")) == 0)
-                    throw SysError(format("opening file ‘%1%’") % logBz2Path);
-                int err;
-                BZFILE * bz = BZ2_bzReadOpen(&err, f, 0, 0, 0, 0);
-                if (!bz) throw Error(format("cannot open bzip2 file ‘%1%’") % logBz2Path);
-                unsigned char buf[128 * 1024];
-                do {
-                    int n = BZ2_bzRead(&err, bz, buf, sizeof(buf));
-                    if (err != BZ_OK && err != BZ_STREAM_END)
-                        throw Error(format("error reading bzip2 file ‘%1%’") % logBz2Path);
-                    writeFull(STDOUT_FILENO, buf, n);
-                } while (err != BZ_STREAM_END);
-                BZ2_bzReadClose(&err, bz);
+                std::cout << *decompress("bzip2", readFile(logBz2Path));
                 found = true;
                 break;
             }
@@ -548,7 +546,7 @@ static void opDumpDB(Strings opFlags, Strings opArgs)
         throw UsageError("no arguments expected");
     PathSet validPaths = store->queryAllValidPaths();
     for (auto & i : validPaths)
-        cout << store->makeValidityRegistration(singleton<PathSet>(i), true, true);
+        cout << store->makeValidityRegistration({i}, true, true);
 }
 
 
@@ -565,14 +563,14 @@ static void registerValidity(bool reregister, bool hashGiven, bool canonicalise)
                 canonicalisePathMetaData(info.path, -1);
             if (!hashGiven) {
                 HashResult hash = hashPath(htSHA256, info.path);
-                info.hash = hash.first;
+                info.narHash = hash.first;
                 info.narSize = hash.second;
             }
             infos.push_back(info);
         }
     }
 
-    ensureLocalStore().registerValidPaths(infos);
+    ensureLocalStore()->registerValidPaths(infos);
 }
 
 
@@ -610,7 +608,7 @@ static void opCheckValidity(Strings opFlags, Strings opArgs)
         else throw UsageError(format("unknown flag ‘%1%’") % i);
 
     for (auto & i : opArgs) {
-        Path path = followLinksToStorePath(i);
+        Path path = store->followLinksToStorePath(i);
         if (!store->isValidPath(path)) {
             if (printInvalid)
                 cout << format("%1%\n") % path;
@@ -673,7 +671,7 @@ static void opDelete(Strings opFlags, Strings opArgs)
         else throw UsageError(format("unknown flag ‘%1%’") % i);
 
     for (auto & i : opArgs)
-        options.pathsToDelete.insert(followLinksToStorePath(i));
+        options.pathsToDelete.insert(store->followLinksToStorePath(i));
 
     GCResults results;
     PrintFreed freed(true, results);
@@ -708,29 +706,23 @@ static void opRestore(Strings opFlags, Strings opArgs)
 
 static void opExport(Strings opFlags, Strings opArgs)
 {
-    bool sign = false;
     for (auto & i : opFlags)
-        if (i == "--sign") sign = true;
-        else throw UsageError(format("unknown flag ‘%1%’") % i);
+        throw UsageError(format("unknown flag ‘%1%’") % i);
 
     FdSink sink(STDOUT_FILENO);
-    Paths sorted = topoSortPaths(*store, PathSet(opArgs.begin(), opArgs.end()));
-    reverse(sorted.begin(), sorted.end());
-    exportPaths(*store, sorted, sign, sink);
+    store->exportPaths(opArgs, sink);
 }
 
 
 static void opImport(Strings opFlags, Strings opArgs)
 {
-    bool requireSignature = false;
     for (auto & i : opFlags)
-        if (i == "--require-signature") requireSignature = true;
-        else throw UsageError(format("unknown flag ‘%1%’") % i);
+        throw UsageError(format("unknown flag ‘%1%’") % i);
 
     if (!opArgs.empty()) throw UsageError("no arguments expected");
 
     FdSource source(STDIN_FILENO);
-    Paths paths = store->importPaths(requireSignature, source);
+    Paths paths = store->importPaths(source, 0);
 
     for (auto & i : paths)
         cout << format("%1%\n") % i << std::flush;
@@ -763,7 +755,7 @@ static void opVerify(Strings opFlags, Strings opArgs)
         else throw UsageError(format("unknown flag ‘%1%’") % i);
 
     if (store->verifyStore(checkContents, repair)) {
-        printMsg(lvlError, "warning: not all errors were fixed");
+        printError("warning: not all errors were fixed");
         throw Exit(1);
     }
 }
@@ -778,14 +770,16 @@ static void opVerifyPath(Strings opFlags, Strings opArgs)
     int status = 0;
 
     for (auto & i : opArgs) {
-        Path path = followLinksToStorePath(i);
+        Path path = store->followLinksToStorePath(i);
         printMsg(lvlTalkative, format("checking path ‘%1%’...") % path);
-        ValidPathInfo info = store->queryPathInfo(path);
-        HashResult current = hashPath(info.hash.type, path);
-        if (current.first != info.hash) {
-            printMsg(lvlError,
+        auto info = store->queryPathInfo(path);
+        HashSink sink(info->narHash.type);
+        store->narFromPath(path, sink);
+        auto current = sink.finish();
+        if (current.first != info->narHash) {
+            printError(
                 format("path ‘%1%’ was modified! expected hash ‘%2%’, got ‘%3%’")
-                % path % printHash(info.hash) % printHash(current.first));
+                % path % printHash(info->narHash) % printHash(current.first));
             status = 1;
         }
     }
@@ -802,8 +796,8 @@ static void opRepairPath(Strings opFlags, Strings opArgs)
         throw UsageError("no flags expected");
 
     for (auto & i : opArgs) {
-        Path path = followLinksToStorePath(i);
-        ensureLocalStore().repairPath(path);
+        Path path = store->followLinksToStorePath(i);
+        ensureLocalStore()->repairPath(path);
     }
 }
 
@@ -816,24 +810,6 @@ static void opOptimise(Strings opFlags, Strings opArgs)
 
     store->optimiseStore();
 }
-
-static void opQueryFailedPaths(Strings opFlags, Strings opArgs)
-{
-    if (!opArgs.empty() || !opFlags.empty())
-        throw UsageError("no arguments expected");
-    PathSet failed = store->queryFailedPaths();
-    for (auto & i : failed)
-        cout << format("%1%\n") % i;
-}
-
-
-static void opClearFailedPaths(Strings opFlags, Strings opArgs)
-{
-    if (!opFlags.empty())
-        throw UsageError("no flags expected");
-    store->clearFailedPaths(PathSet(opArgs.begin(), opArgs.end()));
-}
-
 
 /* Serve the nix store in a way usable by a restricted ssh user. */
 static void opServe(Strings opFlags, Strings opArgs)
@@ -880,7 +856,7 @@ static void opServe(Strings opFlags, Strings opArgs)
             case cmdQueryValidPaths: {
                 bool lock = readInt(in);
                 bool substitute = readInt(in);
-                PathSet paths = readStorePaths<PathSet>(in);
+                PathSet paths = readStorePaths<PathSet>(*store, in);
                 if (lock && writeAllowed)
                     for (auto & path : paths)
                         store->addTempRoot(path);
@@ -895,7 +871,7 @@ static void opServe(Strings opFlags, Strings opArgs)
                         if (!isDerivation(path)) paths2.insert(path);
                     unsigned long long downloadSize, narSize;
                     PathSet willBuild, willSubstitute, unknown;
-                    queryMissing(*store, PathSet(paths2.begin(), paths2.end()),
+                    store->queryMissing(PathSet(paths2.begin(), paths2.end()),
                         willBuild, willSubstitute, unknown, downloadSize, narSize);
                     /* FIXME: should use ensurePath(), but it only
                        does one path at a time. */
@@ -903,7 +879,7 @@ static void opServe(Strings opFlags, Strings opArgs)
                         try {
                             store->buildPaths(willSubstitute);
                         } catch (Error & e) {
-                            printMsg(lvlError, format("warning: %1%") % e.msg());
+                            printError(format("warning: %1%") % e.msg());
                         }
                 }
 
@@ -912,44 +888,45 @@ static void opServe(Strings opFlags, Strings opArgs)
             }
 
             case cmdQueryPathInfos: {
-                PathSet paths = readStorePaths<PathSet>(in);
+                PathSet paths = readStorePaths<PathSet>(*store, in);
                 // !!! Maybe we want a queryPathInfos?
                 for (auto & i : paths) {
-                    if (!store->isValidPath(i))
-                        continue;
-                    ValidPathInfo info = store->queryPathInfo(i);
-                    out << info.path << info.deriver << info.references;
-                    // !!! Maybe we want compression?
-                    out << info.narSize // downloadSize
-                        << info.narSize;
+                    try {
+                        auto info = store->queryPathInfo(i);
+                        out << info->path << info->deriver << info->references;
+                        // !!! Maybe we want compression?
+                        out << info->narSize // downloadSize
+                            << info->narSize;
+                    } catch (InvalidPath &) {
+                    }
                 }
                 out << "";
                 break;
             }
 
             case cmdDumpStorePath:
-                dumpPath(readStorePath(in), out);
+                dumpPath(readStorePath(*store, in), out);
                 break;
 
             case cmdImportPaths: {
                 if (!writeAllowed) throw Error("importing paths is not allowed");
-                store->importPaths(false, in);
+                store->importPaths(in, 0, true); // FIXME: should we skip sig checking?
                 out << 1; // indicate success
                 break;
             }
 
             case cmdExportPaths: {
-                bool sign = readInt(in);
-                Paths sorted = topoSortPaths(*store, readStorePaths<PathSet>(in));
+                readInt(in); // obsolete
+                Paths sorted = store->topoSortPaths(readStorePaths<PathSet>(*store, in));
                 reverse(sorted.begin(), sorted.end());
-                exportPaths(*store, sorted, sign, out);
+                store->exportPaths(sorted, out);
                 break;
             }
 
             case cmdBuildPaths: { /* Used by build-remote.pl. */
 
                 if (!writeAllowed) throw Error("building paths is not allowed");
-                PathSet paths = readStorePaths<PathSet>(in);
+                PathSet paths = readStorePaths<PathSet>(*store, in);
 
                 getBuildSettings();
 
@@ -968,9 +945,9 @@ static void opServe(Strings opFlags, Strings opArgs)
 
                 if (!writeAllowed) throw Error("building paths is not allowed");
 
-                Path drvPath = readStorePath(in); // informational only
+                Path drvPath = readStorePath(*store, in); // informational only
                 BasicDerivation drv;
-                in >> drv;
+                readDerivation(in, *store, drv);
 
                 getBuildSettings();
 
@@ -984,10 +961,10 @@ static void opServe(Strings opFlags, Strings opArgs)
 
             case cmdQueryClosure: {
                 bool includeOutputs = readInt(in);
-                PathSet paths = readStorePaths<PathSet>(in);
+                PathSet paths = readStorePaths<PathSet>(*store, in);
                 PathSet closure;
                 for (auto & i : paths)
-                    computeFSClosure(*store, i, closure, false, includeOutputs);
+                    store->computeFSClosure(i, closure, false, includeOutputs);
                 out << closure;
                 break;
             }
@@ -1098,10 +1075,6 @@ int main(int argc, char * * argv)
                 op = opRepairPath;
             else if (*arg == "--optimise" || *arg == "--optimize")
                 op = opOptimise;
-            else if (*arg == "--query-failed-paths")
-                op = opQueryFailedPaths;
-            else if (*arg == "--clear-failed-paths")
-                op = opClearFailedPaths;
             else if (*arg == "--serve")
                 op = opServe;
             else if (*arg == "--generate-binary-cache-key")
@@ -1129,7 +1102,7 @@ int main(int argc, char * * argv)
         if (!op) throw UsageError("no operation specified");
 
         if (op != opDump && op != opRestore) /* !!! hack */
-            store = openStore(op != opGC);
+            store = openStore();
 
         op(opFlags, opArgs);
     });

@@ -1,4 +1,4 @@
-#! /usr/bin/env bash
+#!/bin/sh
 
 set -e
 
@@ -25,7 +25,7 @@ echo "performing a single-user installation of Nix..." >&2
 
 if ! [ -e $dest ]; then
     cmd="mkdir -m 0755 $dest && chown $USER $dest"
-    echo "directory $dest does not exist; creating it by running ‘$cmd’ using sudo" >&2
+    echo "directory $dest does not exist; creating it by running '$cmd' using sudo" >&2
     if ! sudo sh -c "$cmd"; then
         echo "$0: please manually run ‘$cmd’ as root to create $dest" >&2
         exit 1
@@ -33,7 +33,7 @@ if ! [ -e $dest ]; then
 fi
 
 if ! [ -w $dest ]; then
-    echo "$0: directory $dest exists, but is not writable by you; please run ‘chown -R $USER $dest’ as root" >&2
+    echo "$0: directory $dest exists, but is not writable by you. This could indicate that another user has already performed a single-user installation of Nix on this system. If you wish to enable multi-user support see http://nixos.org/nix/manual/#ssec-multi-user. If you wish to continue with a single-user install for $USER please run ‘chown -R $USER $dest’ as root." >&2
     exit 1
 fi
 
@@ -49,7 +49,10 @@ for i in $(cd $self/store >/dev/null && echo *); do
     fi
     if ! [ -e "$dest/store/$i" ]; then
         cp -Rp "$self/store/$i" "$i_tmp"
+        chmod -R a-w "$i_tmp"
+        chmod +w "$i_tmp"
         mv "$i_tmp" "$dest/store/$i"
+        chmod -w "$dest/store/$i"
     fi
 done
 echo "" >&2
@@ -87,12 +90,12 @@ if [ -z "$_NIX_INSTALLER_TEST" ]; then
 fi
 
 # Make the shell source nix.sh during login.
-p=$NIX_LINK/etc/profile.d/nix.sh
+p=$HOME/.nix-profile/etc/profile.d/nix.sh
 
 added=
 for i in .bash_profile .bash_login .profile; do
     fn="$HOME/$i"
-    if [ -e "$fn" ]; then
+    if [ -w "$fn" ]; then
         if ! grep -q "$p" "$fn"; then
             echo "modifying $fn..." >&2
             echo "if [ -e $p ]; then . $p; fi # added by Nix installer" >> $fn

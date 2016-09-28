@@ -8,7 +8,7 @@ deps="$(nix-store -qR $TEST_ROOT/result)"
 
 nix-store --dump-db > $TEST_ROOT/dump
 
-rm -rf $NIX_DB_DIR
+rm -rf $NIX_STATE_DIR/db
 
 nix-store --load-db < $TEST_ROOT/dump
 

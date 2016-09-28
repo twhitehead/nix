@@ -177,13 +177,19 @@ map (concat "foo") [ "bar" "bla" "abc" ]</programlisting>
   <listitem><para>An <literal>@</literal>-pattern provides a means of referring
   to the whole value being matched:
 
-<programlisting>
-args@{ x, y, z, ... }: z + y + x + args.a</programlisting>
+<programlisting> args@{ x, y, z, ... }: z + y + x + args.a</programlisting>
+
+but can also be written as:
+
+<programlisting> { x, y, z, ... } @ args: z + y + x + args.a</programlisting>
 
   Here <varname>args</varname> is bound to the entire argument, which
   is further matched against the pattern <literal>{ x, y, z,
-  ... }</literal>.</para></listitem>
-
+  ... }</literal>. <literal>@</literal>-pattern makes mainly sense with an 
+  ellipsis(<literal>...</literal>) as you can access attribute names as 
+  <literal>a</literal>, using <literal>args.a</literal>, which was given as an
+  additional attribute to the function.
+  </para></listitem>
 
 </itemizedlist>
 
@@ -193,24 +199,6 @@ a name, you can bind them to an attribute, e.g.,
 <programlisting>
 let concat = { x, y }: x + y;
 in concat { x = "foo"; y = "bar"; }</programlisting>
-
-</para>
-
-<para>A set that has a <literal>__functor</literal> attribute whose value
-is callable (i.e. is itself a function or a set with a
-<literal>__functor</literal> attribute whose value is callable) can be
-applied as if it were a function, with the set itself passed in first
-, e.g.,
-
-<programlisting>
-let add = { __functor = self: x: x + self.x; };
-    inc = add // { x = 1; };
-in inc 1
-</programlisting>
-
-evaluates to <literal>2</literal>. This can be used to attach metadata to a
-function without the caller needing to treat it specially, or to implement
-a form of object-oriented programming, for example.
 
 </para>
 

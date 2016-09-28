@@ -8,33 +8,50 @@ namespace nix {
 
 void builtinFetchurl(const BasicDerivation & drv)
 {
-    auto url = drv.env.find("url");
-    if (url == drv.env.end()) throw Error("attribute ‘url’ missing");
+    auto getAttr = [&](const string & name) {
+        auto i = drv.env.find(name);
+        if (i == drv.env.end()) throw Error(format("attribute ‘%s’ missing") % name);
+        return i->second;
+    };
 
-    /* No need to do TLS verification, because we check the hash of
-       the result anyway. */
-    DownloadOptions options;
-    options.verifyTLS = false;
+    auto fetch = [&](const string & url) {
+        /* No need to do TLS verification, because we check the hash of
+           the result anyway. */
+        DownloadRequest request(url);
+        request.verifyTLS = false;
 
-    /* Show a progress indicator, even though stderr is not a tty. */
-    options.forceProgress = true;
+        /* Show a progress indicator, even though stderr is not a tty. */
+        request.showProgress = DownloadRequest::yes;
 
-    auto data = downloadFile(url->second, options);
+        /* Note: have to use a fresh downloader here because we're in
+           a forked process. */
+        auto data = makeDownloader()->download(request);
+        assert(data.data);
 
-    auto out = drv.env.find("out");
-    if (out == drv.env.end()) throw Error("attribute ‘url’ missing");
+        return data.data;
+    };
 
-    Path storePath = out->second;
-    assertStorePath(storePath);
+    std::shared_ptr<std::string> data;
+
+    try {
+        if (getAttr("outputHashMode") == "flat")
+            data = fetch("http://tarballs.nixos.org/" + getAttr("outputHashAlgo") + "/" + getAttr("outputHash"));
+    } catch (Error & e) {
+        debug(e.what());
+    }
+
+    if (!data) data = fetch(getAttr("url"));
+
+    Path storePath = getAttr("out");
 
     auto unpack = drv.env.find("unpack");
     if (unpack != drv.env.end() && unpack->second == "1") {
-        if (string(data.data, 0, 6) == string("\xfd" "7zXZ\0", 6))
-            data.data = decompressXZ(data.data);
-        StringSource source(data.data);
+        if (string(*data, 0, 6) == string("\xfd" "7zXZ\0", 6))
+            data = decompress("xz", *data);
+        StringSource source(*data);
         restorePath(storePath, source);
     } else
-        writeFile(storePath, data.data);
+        writeFile(storePath, *data);
 
     auto executable = drv.env.find("executable");
     if (executable != drv.env.end() && executable->second == "1") {

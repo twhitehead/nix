@@ -1,6 +1,11 @@
 #pragma once
 
+#include "config.h"
 #include "symbol-table.hh"
+
+#if HAVE_BOEHMGC
+#include <gc/gc_allocator.h>
+#endif
 
 namespace nix {
 
@@ -22,6 +27,7 @@ typedef enum {
     tPrimOp,
     tPrimOpApp,
     tExternal,
+    tFloat
 } ValueType;
 
 
@@ -35,9 +41,11 @@ class Symbol;
 struct Pos;
 class EvalState;
 class XMLWriter;
+class JSONPlaceholder;
 
 
 typedef long NixInt;
+typedef float NixFloat;
 
 /* External values must descend from ExternalValueBase, so that
  * type-agnostic nix functions (e.g. showType) can be implemented
@@ -71,7 +79,7 @@ class ExternalValueBase
 
     /* Print the value as JSON. Defaults to unconvertable, i.e. throws an error */
     virtual void printValueAsJSON(EvalState & state, bool strict,
-        std::ostream & str, PathSet & context) const;
+        JSONPlaceholder & out, PathSet & context) const;
 
     /* Print the value as XML. Defaults to unevaluated */
     virtual void printValueAsXML(EvalState & state, bool strict, bool location,
@@ -141,6 +149,7 @@ struct Value
             Value * left, * right;
         } primOpApp;
         ExternalValueBase * external;
+        NixFloat fpoint;
     };
 
     bool isList() const
@@ -178,6 +187,14 @@ static inline void mkInt(Value & v, NixInt n)
     clearValue(v);
     v.type = tInt;
     v.integer = n;
+}
+
+
+static inline void mkFloat(Value & v, NixFloat n)
+{
+    clearValue(v);
+    v.type = tFloat;
+    v.fpoint = n;
 }
 
 
@@ -236,6 +253,15 @@ void mkPath(Value & v, const char * s);
    and environments reachable from it. Static expressions (Exprs) are
    not included. */
 size_t valueSize(Value & v);
+
+
+#if HAVE_BOEHMGC
+typedef std::vector<Value *, gc_allocator<Value *> > ValueVector;
+typedef std::map<Symbol, Value *, std::less<Symbol>, gc_allocator<Value *> > ValueMap;
+#else
+typedef std::vector<Value *> ValueVector;
+typedef std::map<Symbol, Value *> ValueMap;
+#endif
 
 
 }

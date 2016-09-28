@@ -36,7 +36,7 @@ void removeOldGenerations(std::string dir)
                 if (e.errNo == ENOENT) continue;
             }
             if (link.find("link") != string::npos) {
-                printMsg(lvlInfo, format("removing old generations of profile %1%") % path);
+                printInfo(format("removing old generations of profile %1%") % path);
                 if (deleteOlderThan != "")
                     deleteGenerationsOlderThan(path, deleteOlderThan, dryRun);
                 else
@@ -82,7 +82,7 @@ int main(int argc, char * * argv)
 
         // Run the actual garbage collector.
         if (!dryRun) {
-            store = openStore(false);
+            auto store = openStore();
             options.action = GCOptions::gcDeleteDead;
             GCResults results;
             PrintFreed freed(true, results);

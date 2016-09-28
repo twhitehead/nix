@@ -42,12 +42,14 @@ public:
     string queryDrvPath();
     string queryOutPath();
     string queryOutputName();
-    Outputs queryOutputs();
+    /** Return the list of outputs. The "outputs to install" are determined by `mesa.outputsToInstall`. */
+    Outputs queryOutputs(bool onlyOutputsToInstall = false);
 
     StringSet queryMetaNames();
     Value * queryMeta(const string & name);
     string queryMetaString(const string & name);
-    int queryMetaInt(const string & name, int def);
+    NixInt queryMetaInt(const string & name, NixInt def);
+    NixFloat queryMetaFloat(const string & name, NixFloat def);
     bool queryMetaBool(const string & name, bool def);
     void setMeta(const string & name, Value * v);
 

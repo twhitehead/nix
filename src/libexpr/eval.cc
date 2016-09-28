@@ -5,6 +5,7 @@
 #include "derivations.hh"
 #include "globals.hh"
 #include "eval-inline.hh"
+#include "download.hh"
 
 #include <algorithm>
 #include <cstring>
@@ -128,6 +129,9 @@ static void printValue(std::ostream & str, std::set<const Value *> & active, con
     case tExternal:
         str << *v.external;
         break;
+    case tFloat:
+        str << v.fpoint;
+        break;
     default:
         throw Error("invalid value");
     }
@@ -161,6 +165,7 @@ string showType(const Value & v)
         case tPrimOp: return "a built-in function";
         case tPrimOpApp: return "a partially applied built-in function";
         case tExternal: return v.external->showType();
+        case tFloat: return "a float";
     }
     abort();
 }
@@ -234,17 +239,43 @@ void initGC()
 
 /* Very hacky way to parse $NIX_PATH, which is colon-separated, but
    can contain URLs (e.g. "nixpkgs=https://bla...:foo=https://"). */
-static Strings parseNixPath(const string & in)
+static Strings parseNixPath(const string & s)
 {
-    string marker = "\001//";
-    auto res = tokenizeString<Strings>(replaceStrings(in, "://", marker), ":");
-    for (auto & s : res)
-        s = replaceStrings(s, marker, "://");
+    Strings res;
+
+    auto p = s.begin();
+
+    while (p != s.end()) {
+        auto start = p;
+        auto start2 = p;
+
+        while (p != s.end() && *p != ':') {
+            if (*p == '=') start2 = p + 1;
+            ++p;
+        }
+
+        if (p == s.end()) {
+            if (p != start) res.push_back(std::string(start, p));
+            break;
+        }
+
+        if (*p == ':') {
+            if (isUri(std::string(start2, s.end()))) {
+                ++p;
+                while (p != s.end() && *p != ':') ++p;
+            }
+            res.push_back(std::string(start, p));
+            if (p == s.end()) break;
+        }
+
+        ++p;
+    }
+
     return res;
 }
 
 
-EvalState::EvalState(const Strings & _searchPath)
+EvalState::EvalState(const Strings & _searchPath, ref<Store> store)
     : sWith(symbols.create("<with>"))
     , sOutPath(symbols.create("outPath"))
     , sDrvPath(symbols.create("drvPath"))
@@ -262,6 +293,9 @@ EvalState::EvalState(const Strings & _searchPath)
     , sColumn(symbols.create("column"))
     , sFunctor(symbols.create("__functor"))
     , sToString(symbols.create("__toString"))
+    , sRight(symbols.create("right"))
+    , sWrong(symbols.create("wrong"))
+    , store(store)
     , baseEnv(allocEnv(128))
     , staticBaseEnv(false, 0)
 {
@@ -273,7 +307,7 @@ EvalState::EvalState(const Strings & _searchPath)
 
     /* Initialise the Nix expression search path. */
     Strings paths = parseNixPath(getEnv("NIX_PATH", ""));
-    for (auto & i : _searchPath) addToSearchPath(i, true);
+    for (auto & i : _searchPath) addToSearchPath(i);
     for (auto & i : paths) addToSearchPath(i);
     addToSearchPath("nix=" + settings.nixDataDir + "/nix/corepkgs");
 
@@ -296,16 +330,20 @@ Path EvalState::checkSourcePath(const Path & path_)
     if (!restricted) return path_;
 
     /* Resolve symlinks. */
+    debug(format("checking access to ‘%s’") % path_);
     Path path = canonPath(path_, true);
 
-    for (auto & i : searchPath)
-        if (path == i.second || isInDir(path, i.second))
+    for (auto & i : searchPath) {
+        auto r = resolveSearchPathElem(i);
+        if (!r.first) continue;
+        if (path == r.second || isInDir(path, r.second))
             return path;
+    }
 
     /* To support import-from-derivation, allow access to anything in
        the store. FIXME: only allow access to paths that have been
        constructed by this evaluation. */
-    if (isInStore(path)) return path;
+    if (store->isInStore(path)) return path;
 
 #if 0
     /* Hack to support the chroot dependencies of corepkgs (see
@@ -343,9 +381,9 @@ void EvalState::addPrimOp(const string & name,
 }
 
 
-void EvalState::getBuiltin(const string & name, Value & v)
+Value & EvalState::getBuiltin(const string & name)
 {
-    v = *baseEnv.values[0]->attrs->find(symbols.create(name))->value;
+    return *baseEnv.values[0]->attrs->find(symbols.create(name))->value;
 }
 
 
@@ -426,7 +464,7 @@ void mkString(Value & v, const char * s)
 }
 
 
-void mkString(Value & v, const string & s, const PathSet & context)
+Value & mkString(Value & v, const string & s, const PathSet & context)
 {
     mkString(v, s.c_str());
     if (!context.empty()) {
@@ -437,6 +475,7 @@ void mkString(Value & v, const string & s, const PathSet & context)
             v.string.context[n++] = dupString(i.c_str());
         v.string.context[n] = 0;
     }
+    return v;
 }
 
 
@@ -578,6 +617,12 @@ Value * ExprInt::maybeThunk(EvalState & state, Env & env)
     return &v;
 }
 
+Value * ExprFloat::maybeThunk(EvalState & state, Env & env)
+{
+    nrAvoided++;
+    return &v;
+}
+
 Value * ExprPath::maybeThunk(EvalState & state, Env & env)
 {
     nrAvoided++;
@@ -599,7 +644,7 @@ void EvalState::evalFile(const Path & path, Value & v)
         return;
     }
 
-    startNest(nest, lvlTalkative, format("evaluating file ‘%1%’") % path2);
+    Activity act(*logger, lvlTalkative, format("evaluating file ‘%1%’") % path2);
     Expr * e = parseExprFromFile(checkSourcePath(path2));
     try {
         eval(e, v);
@@ -664,6 +709,11 @@ void ExprInt::eval(EvalState & state, Env & env, Value & v)
     v = this->v;
 }
 
+
+void ExprFloat::eval(EvalState & state, Env & env, Value & v)
+{
+    v = this->v;
+}
 
 void ExprString::eval(EvalState & state, Env & env, Value & v)
 {
@@ -946,11 +996,18 @@ void EvalState::callFunction(Value & fun, Value & arg, Value & v, const Pos & po
     if (fun.type == tAttrs) {
       auto found = fun.attrs->find(sFunctor);
       if (found != fun.attrs->end()) {
+        /* fun may be allocated on the stack of the calling function,
+         * but for functors we may keep a reference, so heap-allocate
+         * a copy and use that instead.
+         */
+        auto & fun2 = *allocValue();
+        fun2 = fun;
+        /* !!! Should we use the attr pos here? */
         forceValue(*found->value, pos);
-        Value * v2 = allocValue();
-        callFunction(*found->value, fun, *v2, pos);
-        forceValue(*v2, pos);
-        return callFunction(*v2, arg, v, pos);
+        Value v2;
+        callFunction(*found->value, fun2, v2, pos);
+        forceValue(v2, pos);
+        return callFunction(v2, arg, v, pos);
       }
     }
 
@@ -1210,6 +1267,7 @@ void ExprConcatStrings::eval(EvalState & state, Env & env, Value & v)
     PathSet context;
     std::ostringstream s;
     NixInt n = 0;
+    NixFloat nf = 0;
 
     bool first = !forceString;
     ValueType firstType = tString;
@@ -1228,15 +1286,30 @@ void ExprConcatStrings::eval(EvalState & state, Env & env, Value & v)
         }
 
         if (firstType == tInt) {
-            if (vTmp.type != tInt)
+            if (vTmp.type == tInt) {
+                n += vTmp.integer;
+            } else if (vTmp.type == tFloat) {
+                // Upgrade the type from int to float;
+                firstType = tFloat;
+                nf = n;
+                nf += vTmp.fpoint;
+            } else
                 throwEvalError("cannot add %1% to an integer, at %2%", showType(vTmp), pos);
-            n += vTmp.integer;
+        } else if (firstType == tFloat) {
+            if (vTmp.type == tInt) {
+                nf += vTmp.integer;
+            } else if (vTmp.type == tFloat) {
+                nf += vTmp.fpoint;
+            } else
+                throwEvalError("cannot add %1% to a float, at %2%", showType(vTmp), pos);
         } else
             s << state.coerceToString(pos, vTmp, context, false, firstType == tString);
     }
 
     if (firstType == tInt)
         mkInt(v, n);
+    else if (firstType == tFloat)
+        mkFloat(v, nf);
     else if (firstType == tPath) {
         if (!context.empty())
             throwEvalError("a string that refers to a store path cannot be appended to a path, at %1%", pos);
@@ -1294,11 +1367,22 @@ NixInt EvalState::forceInt(Value & v, const Pos & pos)
 }
 
 
-bool EvalState::forceBool(Value & v)
+NixFloat EvalState::forceFloat(Value & v, const Pos & pos)
+{
+    forceValue(v, pos);
+    if (v.type == tInt)
+        return v.integer;
+    else if (v.type != tFloat)
+        throwTypeError("value is %1% while a float was expected, at %2%", v, pos);
+    return v.fpoint;
+}
+
+
+bool EvalState::forceBool(Value & v, const Pos & pos)
 {
     forceValue(v);
     if (v.type != tBool)
-        throwTypeError("value is %1% while a Boolean was expected", v);
+        throwTypeError("value is %1% while a Boolean was expected, at %2%", v, pos);
     return v.boolean;
 }
 
@@ -1412,6 +1496,7 @@ string EvalState::coerceToString(const Pos & pos, Value & v, PathSet & context,
         if (v.type == tBool && v.boolean) return "1";
         if (v.type == tBool && !v.boolean) return "";
         if (v.type == tInt) return std::to_string(v.integer);
+        if (v.type == tFloat) return std::to_string(v.fpoint);
         if (v.type == tNull) return "";
 
         if (v.isList()) {
@@ -1442,7 +1527,7 @@ string EvalState::copyPathToStore(PathSet & context, const Path & path)
         dstPath = srcToStore[path];
     else {
         dstPath = settings.readOnlyMode
-            ? computeStorePathForPath(checkSourcePath(path)).first
+            ? store->computeStorePathForPath(checkSourcePath(path)).first
             : store->addToStore(baseNameOf(path), checkSourcePath(path), true, htSHA256, defaultPathFilter, repair);
         srcToStore[path] = dstPath;
         printMsg(lvlChatty, format("copied source ‘%1%’ -> ‘%2%’")
@@ -1473,6 +1558,13 @@ bool EvalState::eqValues(Value & v1, Value & v2)
        uniqList on a list of sets.)  Will remove this eventually. */
     if (&v1 == &v2) return true;
 
+    // Special case type-compatibility between float and int
+    if (v1.type == tInt && v2.type == tFloat)
+        return v1.integer == v2.fpoint;
+    if (v1.type == tFloat && v2.type == tInt)
+        return v1.fpoint == v2.integer;
+
+    // All other types are not compatible with each other.
     if (v1.type != v2.type) return false;
 
     switch (v1.type) {
@@ -1529,6 +1621,9 @@ bool EvalState::eqValues(Value & v1, Value & v2)
 
         case tExternal:
             return *v1.external == *v2.external;
+
+        case tFloat:
+            return v1.fpoint == v2.fpoint;
 
         default:
             throwEvalError("cannot compare %1% with %2%", showType(v1), showType(v2));

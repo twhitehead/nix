@@ -29,7 +29,7 @@ bool useCaseHack =
     false;
 #endif
 
-static string archiveVersion1 = "nix-archive-1";
+const std::string narVersionMagic1 = "nix-archive-1";
 
 static string caseHackSuffix = "~nix~case~hack~";
 
@@ -41,15 +41,15 @@ static void dumpContents(const Path & path, size_t size,
 {
     sink << "contents" << size;
 
-    AutoCloseFD fd = open(path.c_str(), O_RDONLY);
-    if (fd == -1) throw SysError(format("opening file ‘%1%’") % path);
+    AutoCloseFD fd = open(path.c_str(), O_RDONLY | O_CLOEXEC);
+    if (!fd) throw SysError(format("opening file ‘%1%’") % path);
 
     unsigned char buf[65536];
     size_t left = size;
 
     while (left > 0) {
         size_t n = left > sizeof(buf) ? sizeof(buf) : left;
-        readFull(fd, buf, n);
+        readFull(fd.get(), buf, n);
         left -= n;
         sink(buf, n);
     }
@@ -84,7 +84,7 @@ static void dump(const Path & path, Sink & sink, PathFilter & filter)
                 string name(i.name);
                 size_t pos = i.name.find(caseHackSuffix);
                 if (pos != string::npos) {
-                    printMsg(lvlDebug, format("removing case hack suffix from ‘%1%’") % (path + "/" + i.name));
+                    debug(format("removing case hack suffix from ‘%1%’") % (path + "/" + i.name));
                     name.erase(pos);
                 }
                 if (unhacked.find(name) != unhacked.end())
@@ -113,8 +113,14 @@ static void dump(const Path & path, Sink & sink, PathFilter & filter)
 
 void dumpPath(const Path & path, Sink & sink, PathFilter & filter)
 {
-    sink << archiveVersion1;
+    sink << narVersionMagic1;
     dump(path, sink, filter);
+}
+
+
+void dumpString(const std::string & s, Sink & sink)
+{
+    sink << narVersionMagic1 << "(" << "type" << "regular" << "contents" << s << ")";
 }
 
 
@@ -214,7 +220,8 @@ static void parse(ParseSink & sink, Source & source, const Path & path)
         }
 
         else if (s == "executable" && type == tpRegular) {
-            readString(source);
+            auto s = readString(source);
+            if (s != "") throw badArchive("executable marker has non-empty value");
             sink.isExecutable();
         }
 
@@ -241,7 +248,7 @@ static void parse(ParseSink & sink, Source & source, const Path & path)
                     if (useCaseHack) {
                         auto i = names.find(name);
                         if (i != names.end()) {
-                            printMsg(lvlDebug, format("case collision between ‘%1%’ and ‘%2%’") % i->first % name);
+                            debug(format("case collision between ‘%1%’ and ‘%2%’") % i->first % name);
                             name += caseHackSuffix;
                             name += std::to_string(++i->second);
                         } else
@@ -275,7 +282,7 @@ void parseDump(ParseSink & sink, Source & source)
         /* This generally means the integer at the start couldn't be
            decoded.  Ignore and throw the exception below. */
     }
-    if (version != archiveVersion1)
+    if (version != narVersionMagic1)
         throw badArchive("input doesn't look like a Nix archive");
     parse(sink, source, "");
 }
@@ -296,17 +303,16 @@ struct RestoreSink : ParseSink
     void createRegularFile(const Path & path)
     {
         Path p = dstPath + path;
-        fd.close();
-        fd = open(p.c_str(), O_CREAT | O_EXCL | O_WRONLY, 0666);
-        if (fd == -1) throw SysError(format("creating file ‘%1%’") % p);
+        fd = open(p.c_str(), O_CREAT | O_EXCL | O_WRONLY | O_CLOEXEC, 0666);
+        if (!fd) throw SysError(format("creating file ‘%1%’") % p);
     }
 
     void isExecutable()
     {
         struct stat st;
-        if (fstat(fd, &st) == -1)
+        if (fstat(fd.get(), &st) == -1)
             throw SysError("fstat");
-        if (fchmod(fd, st.st_mode | (S_IXUSR | S_IXGRP | S_IXOTH)) == -1)
+        if (fchmod(fd.get(), st.st_mode | (S_IXUSR | S_IXGRP | S_IXOTH)) == -1)
             throw SysError("fchmod");
     }
 
@@ -314,7 +320,7 @@ struct RestoreSink : ParseSink
     {
 #if HAVE_POSIX_FALLOCATE
         if (len) {
-            errno = posix_fallocate(fd, 0, len);
+            errno = posix_fallocate(fd.get(), 0, len);
             /* Note that EINVAL may indicate that the underlying
                filesystem doesn't support preallocation (e.g. on
                OpenSolaris).  Since preallocation is just an
@@ -327,7 +333,7 @@ struct RestoreSink : ParseSink
 
     void receiveContents(unsigned char * data, unsigned int len)
     {
-        writeFull(fd, data, len);
+        writeFull(fd.get(), data, len);
     }
 
     void createSymlink(const Path & path, const string & target)
