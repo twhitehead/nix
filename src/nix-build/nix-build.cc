@@ -16,6 +16,8 @@
 
 using namespace nix;
 
+extern char * * environ;
+
 /* Recreate the effect of the perl shellwords function, breaking up a
  * string into arguments like a shell word, including escapes
  */
@@ -79,7 +81,8 @@ int main(int argc, char ** argv)
         auto pure = false;
         auto fromArgs = false;
         auto packages = false;
-        auto interactive = true;
+        // Same condition as bash uses for interactive shells
+        auto interactive = isatty(STDIN_FILENO) && isatty(STDERR_FILENO);
 
         Strings instArgs;
         Strings buildArgs;
@@ -103,6 +106,7 @@ int main(int argc, char ** argv)
         std::vector<string> args;
         for (int i = 1; i < argc; ++i)
             args.push_back(argv[i]);
+
         // Heuristic to see if we're invoked as a shebang script, namely, if we
         // have a single argument, it's the name of an executable file, and it
         // starts with "#!".
@@ -113,9 +117,9 @@ int main(int argc, char ** argv)
                 if (std::regex_search(lines.front(), std::regex("^#!"))) {
                     lines.pop_front();
                     inShebang = true;
-                    for (int i = 2; i < argc - 1; ++i)
+                    for (int i = 2; i < argc; ++i)
                         savedArgs.push_back(argv[i]);
-                    std::vector<string> args;
+                    args.clear();
                     for (auto line : lines) {
                         line = chomp(line);
                         std::smatch match;
@@ -132,15 +136,11 @@ int main(int argc, char ** argv)
 
             if (arg == "--help") {
                 deletePath(tmpDir);
-                tmpDir.cancel();
-                execlp("man", "man", myName, NULL);
-                throw SysError("executing man");
+                showManPage(myName);
             }
 
-            else if (arg == "--version") {
-                std::cout << myName << " (Nix) " << nixVersion << '\n';
-                return;
-            }
+            else if (arg == "--version")
+                printVersion(myName);
 
             else if (arg == "--add-drv-link") {
                 drvLink = "./derivation";
@@ -274,6 +274,7 @@ int main(int argc, char ** argv)
                 if (n >= args.size()) {
                     throw UsageError(format("%1% requires an argument") % arg);
                 }
+                interactive = false;
                 auto interpreter = args[n];
                 auto execArgs = "";
 
@@ -285,9 +286,8 @@ int main(int argc, char ** argv)
                 // executes it unless it contains the string "perl" or "indir",
                 // or (undocumented) argv[0] does not contain "perl". Exploit
                 // the latter by doing "exec -a".
-                if (std::regex_search(interpreter, std::regex("perl"))) {
-                        execArgs = "-a PERL";
-                }
+                if (std::regex_search(interpreter, std::regex("perl")))
+                    execArgs = "-a PERL";
 
                 std::ostringstream joined;
                 for (const auto & i : savedArgs)
@@ -298,7 +298,6 @@ int main(int argc, char ** argv)
                     // read the shebang to understand which packages to read from. Since
                     // this is handled via nix-shell -p, we wrap our ruby script execution
                     // in ruby -e 'load' which ignores the shebangs.
-
                     envCommand = (format("exec %1% %2% -e 'load(\"%3%\") -- %4%") % execArgs % interpreter % script % joined.str()).str();
                 } else {
                     envCommand = (format("exec %1% %2% %3% %4%") % execArgs % interpreter % script % joined.str()).str();
@@ -409,7 +408,7 @@ int main(int argc, char ** argv)
                 env["NIX_STORE"] = store->storeDir;
 
                 for (auto & var : drv.env)
-                    env.emplace(var);
+                    env[var.first] = var.second;
 
                 restoreAffinity();
 
@@ -418,7 +417,7 @@ int main(int argc, char ** argv)
                 // environment variables and shell functions.  Also don't lose
                 // the current $PATH directories.
                 auto rcfile = (Path) tmpDir + "/rc";
-                writeFile(rcfile, (format(
+                writeFile(rcfile, fmt(
                         "rm -rf '%1%'; "
                         "[ -n \"$PS1\" ] && [ -e ~/.bashrc ] && source ~/.bashrc; "
                         "%2%"
@@ -432,13 +431,12 @@ int main(int argc, char ** argv)
                         "unset NIX_INDENT_MAKE; "
                         "shopt -u nullglob; "
                         "unset TZ; %4%"
-                        "%5%"
-                        )
-                        % (Path) tmpDir
-                        % (pure ? "" : "p=$PATH; ")
-                        % (pure ? "" : "PATH=$PATH:$p; unset p; ")
-                        % (getenv("TZ") ? (string("export TZ='") + getenv("TZ") + "'; ") : "")
-                        % envCommand).str());
+                        "%5%",
+                        (Path) tmpDir,
+                        (pure ? "" : "p=$PATH; "),
+                        (pure ? "" : "PATH=$PATH:$p; unset p; "),
+                        (getenv("TZ") ? (string("export TZ='") + getenv("TZ") + "'; ") : ""),
+                        envCommand));
 
                 Strings envStrs;
                 for (auto & i : env)
@@ -448,11 +446,19 @@ int main(int argc, char ** argv)
                     ? Strings{"bash", "--rcfile", rcfile}
                     : Strings{"bash", rcfile};
 
-                execvpe(getEnv("NIX_BUILD_SHELL", "bash").c_str(),
-                        stringsToCharPtrs(args).data(),
-                        stringsToCharPtrs(envStrs).data());
+                auto envPtrs = stringsToCharPtrs(envStrs);
 
-                throw SysError("executing shell");
+                auto shell = getEnv("NIX_BUILD_SHELL", "bash");
+
+                environ = envPtrs.data();
+
+                auto argPtrs = stringsToCharPtrs(args);
+
+                restoreSignals();
+
+                execvp(shell.c_str(), argPtrs.data());
+
+                throw SysError("executing shell ‘%s’", shell);
             }
 
             // Ugly hackery to make "nix-build -A foo.all" produce symlinks
@@ -507,4 +513,3 @@ int main(int argc, char ** argv)
         }
     });
 }
-

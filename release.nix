@@ -7,7 +7,7 @@ let
 
   pkgs = import <nixpkgs> {};
 
-  systems = [ "x86_64-linux" "i686-linux" "x86_64-darwin" /* "x86_64-freebsd" "i686-freebsd" */ ];
+  systems = [ "x86_64-linux" "i686-linux" "x86_64-darwin" ];
 
 
   jobs = rec {
@@ -20,20 +20,22 @@ let
         name = "nix-tarball";
         version = builtins.readFile ./version;
         versionSuffix = if officialRelease then "" else "pre${toString nix.revCount}_${nix.shortRev}";
-        src = if lib.inNixShell then null else nix;
+        src = nix;
         inherit officialRelease;
 
         buildInputs =
-          [ curl bison flex perl libxml2 libxslt bzip2 xz
-            pkgconfig sqlite libsodium
+          [ curl bison flex perl libxml2 libxslt
+            bzip2 xz brotli
+            pkgconfig sqlite libsodium boehmgc
             docbook5 docbook5_xsl
             autoconf-archive
-          ] ++ lib.optional (!lib.inNixShell) git;
+            git
+          ];
 
         configureFlags = ''
           --with-dbi=${perlPackages.DBI}/${perl.libPrefix}
           --with-dbd-sqlite=${perlPackages.DBDSQLite}/${perl.libPrefix}
-          --with-www-curl=${perlPackages.WWWCurl}/${perl.libPrefix}
+          --enable-gc
         '';
 
         postUnpack = ''
@@ -72,9 +74,12 @@ let
         src = tarball;
 
         buildInputs =
-          [ curl perl bzip2 xz openssl pkgconfig sqlite boehmgc ]
-          ++ lib.optional stdenv.isLinux libsodium
-          ++ lib.optional stdenv.isLinux
+          [ curl perl
+            bzip2 xz brotli
+            openssl pkgconfig sqlite boehmgc
+          ]
+          ++ lib.optional (stdenv.isLinux || stdenv.isDarwin) libsodium
+          ++ lib.optional (stdenv.isLinux || stdenv.isDarwin)
             (aws-sdk-cpp.override {
               apis = ["s3"];
               customMemoryManagement = false;
@@ -84,7 +89,6 @@ let
           --disable-init-state
           --with-dbi=${perlPackages.DBI}/${perl.libPrefix}
           --with-dbd-sqlite=${perlPackages.DBDSQLite}/${perl.libPrefix}
-          --with-www-curl=${perlPackages.WWWCurl}/${perl.libPrefix}
           --enable-gc
           --sysconfdir=/etc
         '';
@@ -156,7 +160,6 @@ let
           --disable-init-state
           --with-dbi=${perlPackages.DBI}/${perl.libPrefix}
           --with-dbd-sqlite=${perlPackages.DBDSQLite}/${perl.libPrefix}
-          --with-www-curl=${perlPackages.WWWCurl}/${perl.libPrefix}
         '';
 
         dontInstall = false;
@@ -172,8 +175,8 @@ let
       };
 
 
-    rpm_fedora21i386 = makeRPM_i686 (diskImageFuns: diskImageFuns.fedora21i386) [ "libsodium-devel" ];
-    rpm_fedora21x86_64 = makeRPM_x86_64 (diskImageFunsFun: diskImageFunsFun.fedora21x86_64) [ "libsodium-devel" ];
+    rpm_fedora25i386 = makeRPM_i686 (diskImageFuns: diskImageFuns.fedora25i386) [ "libsodium-devel" ];
+    rpm_fedora25x86_64 = makeRPM_x86_64 (diskImageFunsFun: diskImageFunsFun.fedora25x86_64) [ "libsodium-devel" ];
 
 
     deb_debian8i386 = makeDeb_i686 (diskImageFuns: diskImageFuns.debian8i386) [ "libsodium-dev" ] [ "libsodium13" ];
@@ -181,12 +184,10 @@ let
 
     deb_ubuntu1410i386 = makeDeb_i686 (diskImageFuns: diskImageFuns.ubuntu1410i386) [] [];
     deb_ubuntu1410x86_64 = makeDeb_x86_64 (diskImageFuns: diskImageFuns.ubuntu1410x86_64) [] [];
-    deb_ubuntu1504i386 = makeDeb_i686 (diskImageFuns: diskImageFuns.ubuntu1504i386) [ "libsodium-dev" ] [ "libsodium13" ];
-    deb_ubuntu1504x86_64 = makeDeb_x86_64 (diskImageFuns: diskImageFuns.ubuntu1504x86_64) [ "libsodium-dev" ] [ "libsodium13" ];
-    deb_ubuntu1510i386 = makeDeb_i686 (diskImageFuns: diskImageFuns.ubuntu1510i386) [ "libsodium-dev" ] [ "libsodium13"];
-    deb_ubuntu1510x86_64 = makeDeb_x86_64 (diskImageFuns: diskImageFuns.ubuntu1510x86_64) [ "libsodium-dev" ] [ "libsodium13" ];
     deb_ubuntu1604i386 = makeDeb_i686 (diskImageFuns: diskImageFuns.ubuntu1604i386) [ "libsodium-dev" ] [ "libsodium18" ];
     deb_ubuntu1604x86_64 = makeDeb_x86_64 (diskImageFuns: diskImageFuns.ubuntu1604x86_64) [ "libsodium-dev" ] [ "libsodium18" ];
+    deb_ubuntu1610i386 = makeDeb_i686 (diskImageFuns: diskImageFuns.ubuntu1610i386) [ "libsodium-dev" ] [ "libsodium18" ];
+    deb_ubuntu1610x86_64 = makeDeb_x86_64 (diskImageFuns: diskImageFuns.ubuntu1610x86_64) [ "libsodium-dev" ] [ "libsodium18" ];
 
 
     # System tests.
@@ -243,22 +244,18 @@ let
       meta.description = "Release-critical builds";
       constituents =
         [ tarball
-          #build.i686-freebsd
           build.i686-linux
           build.x86_64-darwin
-          #build.x86_64-freebsd
           build.x86_64-linux
-          #binaryTarball.i686-freebsd
           binaryTarball.i686-linux
           binaryTarball.x86_64-darwin
-          #binaryTarball.x86_64-freebsd
           binaryTarball.x86_64-linux
           deb_debian8i386
           deb_debian8x86_64
-          deb_ubuntu1504i386
-          deb_ubuntu1504x86_64
-          rpm_fedora21i386
-          rpm_fedora21x86_64
+          deb_ubuntu1604i386
+          deb_ubuntu1604x86_64
+          rpm_fedora25i386
+          rpm_fedora25x86_64
           tests.remoteBuilds
           tests.nix-copy-closure
           tests.binaryTarball
@@ -283,11 +280,12 @@ let
       src = jobs.tarball;
       diskImage = (diskImageFun vmTools.diskImageFuns)
         { extraPackages =
-            [ "perl-DBD-SQLite" "perl-devel" "sqlite" "sqlite-devel" "bzip2-devel" "emacs" "perl-WWW-Curl" "libcurl-devel" "openssl-devel" "xz-devel" ]
+            [ "perl-DBD-SQLite" "perl-devel" "sqlite" "sqlite-devel" "bzip2-devel" "emacs" "libcurl-devel" "openssl-devel" "xz-devel" ]
             ++ extraPackages; };
       memSize = 1024;
       meta.schedulingPriority = 50;
       postRPMInstall = "cd /tmp/rpmout/BUILD/nix-* && make installcheck";
+      #enableParallelBuilding = true;
     };
 
 
@@ -315,6 +313,7 @@ let
         ++ extraDebPackages;
       debMaintainer = "Eelco Dolstra <eelco.dolstra@logicblox.com>";
       doInstallCheck = true;
+      #enableParallelBuilding = true;
     };
 
 

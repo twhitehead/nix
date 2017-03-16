@@ -1,5 +1,3 @@
-#include "config.h"
-
 #include "common-args.hh"
 #include "globals.hh"
 #include "shared.hh"
@@ -22,12 +20,6 @@
 
 
 namespace nix {
-
-
-static void sigintHandler(int signo)
-{
-    _isInterrupted = 1;
-}
 
 
 static bool gcWarning = true;
@@ -103,6 +95,9 @@ static void opensslLockCallback(int mode, int type, const char * file, int line)
 }
 
 
+static void sigHandler(int signo) { }
+
+
 void initNix()
 {
     /* Turn on buffering for cerr. */
@@ -117,32 +112,21 @@ void initNix()
     opensslLocks = std::vector<std::mutex>(CRYPTO_num_locks());
     CRYPTO_set_locking_callback(opensslLockCallback);
 
-    settings.processEnvironment();
     settings.loadConfFile();
 
-    /* Catch SIGINT. */
-    struct sigaction act;
-    act.sa_handler = sigintHandler;
-    sigemptyset(&act.sa_mask);
-    act.sa_flags = 0;
-    if (sigaction(SIGINT, &act, 0))
-        throw SysError("installing handler for SIGINT");
-    if (sigaction(SIGTERM, &act, 0))
-        throw SysError("installing handler for SIGTERM");
-    if (sigaction(SIGHUP, &act, 0))
-        throw SysError("installing handler for SIGHUP");
-
-    /* Ignore SIGPIPE. */
-    act.sa_handler = SIG_IGN;
-    act.sa_flags = 0;
-    if (sigaction(SIGPIPE, &act, 0))
-        throw SysError("ignoring SIGPIPE");
+    startSignalHandlerThread();
 
     /* Reset SIGCHLD to its default. */
+    struct sigaction act;
+    sigemptyset(&act.sa_mask);
     act.sa_handler = SIG_DFL;
     act.sa_flags = 0;
     if (sigaction(SIGCHLD, &act, 0))
         throw SysError("resetting SIGCHLD");
+
+    /* Install a dummy SIGUSR1 handler for use with pthread_kill(). */
+    act.sa_handler = sigHandler;
+    if (sigaction(SIGUSR1, &act, 0)) throw SysError("handling SIGUSR1");
 
     /* Register a SIGSEGV handler to detect stack overflows. */
     detectStackOverflow();
@@ -183,6 +167,10 @@ struct LegacyArgs : public MixCommonArgs
             settings.set("build-fallback", "true");
         });
 
+        mkFlag1('j', "max-jobs", "jobs", "maximum number of parallel builds", [=](std::string s) {
+            settings.set("build-max-jobs", s);
+        });
+
         auto intSettingAlias = [&](char shortName, const std::string & longName,
             const std::string & description, const std::string & dest) {
             mkFlag<unsigned int>(shortName, longName, description, [=](unsigned int n) {
@@ -190,7 +178,6 @@ struct LegacyArgs : public MixCommonArgs
             });
         };
 
-        intSettingAlias('j', "max-jobs", "maximum number of parallel builds", "build-max-jobs");
         intSettingAlias(0, "cores", "maximum number of CPU cores to use inside a build", "build-cores");
         intSettingAlias(0, "max-silent-time", "number of seconds of silence before a build is killed", "build-max-silent-time");
         intSettingAlias(0, "timeout", "number of seconds before a build is killed", "build-timeout");
@@ -259,7 +246,7 @@ void printVersion(const string & programName)
 
 void showManPage(const string & name)
 {
-    restoreSIGPIPE();
+    restoreSignals();
     execlp("man", "man", name.c_str(), NULL);
     throw SysError(format("command ‘man %1%’ failed") % name.c_str());
 }
@@ -267,6 +254,8 @@ void showManPage(const string & name)
 
 int handleExceptions(const string & programName, std::function<void()> fun)
 {
+    ReceiveInterrupts receiveInterrupts; // FIXME: need better place for this
+
     string error = ANSI_RED "error:" ANSI_NORMAL " ";
     try {
         try {
@@ -310,16 +299,6 @@ RunPager::RunPager()
     if (!pager) pager = getenv("PAGER");
     if (pager && ((string) pager == "" || (string) pager == "cat")) return;
 
-    /* Ignore SIGINT. The pager will handle it (and we'll get
-       SIGPIPE). */
-    struct sigaction act;
-    act.sa_handler = SIG_IGN;
-    act.sa_flags = 0;
-    sigemptyset(&act.sa_mask);
-    if (sigaction(SIGINT, &act, 0)) throw SysError("ignoring SIGINT");
-
-    restoreSIGPIPE();
-
     Pipe toPager;
     toPager.create();
 
@@ -328,6 +307,7 @@ RunPager::RunPager()
             throw SysError("dupping stdin");
         if (!getenv("LESS"))
             setenv("LESS", "FRSXMK", 1);
+        restoreSignals();
         if (pager)
             execl("/bin/sh", "sh", "-c", pager, NULL);
         execlp("pager", "pager", NULL);
@@ -335,6 +315,8 @@ RunPager::RunPager()
         execlp("more", "more", NULL);
         throw SysError(format("executing ‘%1%’") % pager);
     });
+
+    pid.setKillSignal(SIGINT);
 
     if (dup2(toPager.writeSide.get(), STDOUT_FILENO) == -1)
         throw SysError("dupping stdout");
@@ -347,7 +329,7 @@ RunPager::~RunPager()
         if (pid != -1) {
             std::cout.flush();
             close(STDOUT_FILENO);
-            pid.wait(true);
+            pid.wait();
         }
     } catch (...) {
         ignoreException();

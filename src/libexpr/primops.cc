@@ -8,6 +8,7 @@
 #include "names.hh"
 #include "store-api.hh"
 #include "util.hh"
+#include "json.hh"
 #include "value-to-json.hh"
 #include "value-to-xml.hh"
 #include "primops.hh"
@@ -18,6 +19,7 @@
 
 #include <algorithm>
 #include <cstring>
+#include <regex>
 #include <dlfcn.h>
 
 
@@ -57,6 +59,8 @@ void EvalState::realiseContext(const PathSet & context)
             drvs.insert(decoded.first + "!" + decoded.second);
     }
     if (!drvs.empty()) {
+        if (!settings.enableImportFromDerivation)
+            throw EvalError(format("attempted to realize ‘%1%’ during evaluation but 'allow-import-from-derivation' is false") % *(drvs.begin()));
         /* For performance, prefetch all substitute info. */
         PathSet willBuild, willSubstitute, unknown;
         unsigned long long downloadSize, narSize;
@@ -473,6 +477,13 @@ static void prim_derivationStrict(EvalState & state, const Pos & pos, Value * * 
         throw;
     }
 
+    /* Check whether attributes should be passed as a JSON file. */
+    std::ostringstream jsonBuf;
+    std::unique_ptr<JSONObject> jsonObject;
+    attr = args[0]->attrs->find(state.sStructuredAttrs);
+    if (attr != args[0]->attrs->end() && state.forceBool(*attr->value, pos))
+        jsonObject = std::make_unique<JSONObject>(jsonBuf);
+
     /* Check whether null attributes should be ignored. */
     bool ignoreNulls = false;
     attr = args[0]->attrs->find(state.sIgnoreNulls);
@@ -490,24 +501,48 @@ static void prim_derivationStrict(EvalState & state, const Pos & pos, Value * * 
     StringSet outputs;
     outputs.insert("out");
 
-    for (auto & i : *args[0]->attrs) {
-        if (i.name == state.sIgnoreNulls) continue;
-        string key = i.name;
+    for (auto & i : args[0]->attrs->lexicographicOrder()) {
+        if (i->name == state.sIgnoreNulls) continue;
+        string key = i->name;
         Activity act(*logger, lvlVomit, format("processing attribute ‘%1%’") % key);
+
+        auto handleHashMode = [&](const std::string & s) {
+            if (s == "recursive") outputHashRecursive = true;
+            else if (s == "flat") outputHashRecursive = false;
+            else throw EvalError("invalid value ‘%s’ for ‘outputHashMode’ attribute, at %s", s, posDrvName);
+        };
+
+        auto handleOutputs = [&](const Strings & ss) {
+            outputs.clear();
+            for (auto & j : ss) {
+                if (outputs.find(j) != outputs.end())
+                    throw EvalError(format("duplicate derivation output ‘%1%’, at %2%") % j % posDrvName);
+                /* !!! Check whether j is a valid attribute
+                   name. */
+                /* Derivations cannot be named ‘drv’, because
+                   then we'd have an attribute ‘drvPath’ in
+                   the resulting set. */
+                if (j == "drv")
+                    throw EvalError(format("invalid derivation output name ‘drv’, at %1%") % posDrvName);
+                outputs.insert(j);
+            }
+            if (outputs.empty())
+                throw EvalError(format("derivation cannot have an empty set of outputs, at %1%") % posDrvName);
+        };
 
         try {
 
             if (ignoreNulls) {
-                state.forceValue(*i.value);
-                if (i.value->type == tNull) continue;
+                state.forceValue(*i->value);
+                if (i->value->type == tNull) continue;
             }
 
             /* The `args' attribute is special: it supplies the
                command-line arguments to the builder. */
             if (key == "args") {
-                state.forceList(*i.value, pos);
-                for (unsigned int n = 0; n < i.value->listSize(); ++n) {
-                    string s = state.coerceToString(posDrvName, *i.value->listElems()[n], context, true);
+                state.forceList(*i->value, pos);
+                for (unsigned int n = 0; n < i->value->listSize(); ++n) {
+                    string s = state.coerceToString(posDrvName, *i->value->listElems()[n], context, true);
                     drv.args.push_back(s);
                 }
             }
@@ -515,39 +550,51 @@ static void prim_derivationStrict(EvalState & state, const Pos & pos, Value * * 
             /* All other attributes are passed to the builder through
                the environment. */
             else {
-                string s = state.coerceToString(posDrvName, *i.value, context, true);
-                drv.env[key] = s;
-                if (key == "builder") drv.builder = s;
-                else if (i.name == state.sSystem) drv.platform = s;
-                else if (i.name == state.sName) {
-                    drvName = s;
-                    printMsg(lvlVomit, format("derivation name is ‘%1%’") % drvName);
-                }
-                else if (key == "outputHash") outputHash = s;
-                else if (key == "outputHashAlgo") outputHashAlgo = s;
-                else if (key == "outputHashMode") {
-                    if (s == "recursive") outputHashRecursive = true;
-                    else if (s == "flat") outputHashRecursive = false;
-                    else throw EvalError(format("invalid value ‘%1%’ for ‘outputHashMode’ attribute, at %2%") % s % posDrvName);
-                }
-                else if (key == "outputs") {
-                    Strings tmp = tokenizeString<Strings>(s);
-                    outputs.clear();
-                    for (auto & j : tmp) {
-                        if (outputs.find(j) != outputs.end())
-                            throw EvalError(format("duplicate derivation output ‘%1%’, at %2%") % j % posDrvName);
-                        /* !!! Check whether j is a valid attribute
-                           name. */
-                        /* Derivations cannot be named ‘drv’, because
-                           then we'd have an attribute ‘drvPath’ in
-                           the resulting set. */
-                        if (j == "drv")
-                            throw EvalError(format("invalid derivation output name ‘drv’, at %1%") % posDrvName);
-                        outputs.insert(j);
+
+                if (jsonObject) {
+
+                    if (i->name == state.sStructuredAttrs) continue;
+
+                    auto placeholder(jsonObject->placeholder(key));
+                    printValueAsJSON(state, true, *i->value, placeholder, context);
+
+                    if (i->name == state.sBuilder)
+                        drv.builder = state.forceString(*i->value, context, posDrvName);
+                    else if (i->name == state.sSystem)
+                        drv.platform = state.forceStringNoCtx(*i->value, posDrvName);
+                    else if (i->name == state.sName)
+                        drvName = state.forceStringNoCtx(*i->value, posDrvName);
+                    else if (key == "outputHash")
+                        outputHash = state.forceStringNoCtx(*i->value, posDrvName);
+                    else if (key == "outputHashAlgo")
+                        outputHashAlgo = state.forceStringNoCtx(*i->value, posDrvName);
+                    else if (key == "outputHashMode")
+                        handleHashMode(state.forceStringNoCtx(*i->value, posDrvName));
+                    else if (key == "outputs") {
+                        /* Require ‘outputs’ to be a list of strings. */
+                        state.forceList(*i->value, posDrvName);
+                        Strings ss;
+                        for (unsigned int n = 0; n < i->value->listSize(); ++n)
+                            ss.emplace_back(state.forceStringNoCtx(*i->value->listElems()[n], posDrvName));
+                        handleOutputs(ss);
                     }
-                    if (outputs.empty())
-                        throw EvalError(format("derivation cannot have an empty set of outputs, at %1%") % posDrvName);
+
+                } else {
+                    auto s = state.coerceToString(posDrvName, *i->value, context, true);
+                    drv.env.emplace(key, s);
+                    if (i->name == state.sBuilder) drv.builder = s;
+                    else if (i->name == state.sSystem) drv.platform = s;
+                    else if (i->name == state.sName) {
+                        drvName = s;
+                        printMsg(lvlVomit, format("derivation name is ‘%1%’") % drvName);
+                    }
+                    else if (key == "outputHash") outputHash = s;
+                    else if (key == "outputHashAlgo") outputHashAlgo = s;
+                    else if (key == "outputHashMode") handleHashMode(s);
+                    else if (key == "outputs")
+                        handleOutputs(tokenizeString<Strings>(s));
                 }
+
             }
 
         } catch (Error & e) {
@@ -555,6 +602,11 @@ static void prim_derivationStrict(EvalState & state, const Pos & pos, Value * * 
                 % key % drvName % posDrvName);
             throw;
         }
+    }
+
+    if (jsonObject) {
+        jsonObject.reset();
+        drv.env.emplace("__json", jsonBuf.str());
     }
 
     /* Everything in the context of the strings in the derivation
@@ -778,7 +830,7 @@ static void prim_readFile(EvalState & state, const Pos & pos, Value * * args, Va
     string s = readFile(state.checkSourcePath(path));
     if (s.find((char) 0) != string::npos)
         throw Error(format("the contents of the file ‘%1%’ cannot be represented as a Nix string") % path);
-    mkString(v, s.c_str(), context);
+    mkString(v, s.c_str());
 }
 
 
@@ -997,12 +1049,9 @@ static void prim_attrNames(EvalState & state, const Pos & pos, Value * * args, V
 
     state.mkList(v, args[0]->attrs->size());
 
-    unsigned int n = 0;
-    for (auto & i : *args[0]->attrs)
-        mkString(*(v.listElems()[n++] = state.allocValue()), i.name);
-
-    std::sort(v.listElems(), v.listElems() + n,
-        [](Value * v1, Value * v2) { return strcmp(v1->string.s, v2->string.s) < 0; });
+    size_t n = 0;
+    for (auto & i : args[0]->attrs->lexicographicOrder())
+        mkString(*(v.listElems()[n++] = state.allocValue()), i->name);
 }
 
 
@@ -1515,10 +1564,16 @@ static void prim_div(EvalState & state, const Pos & pos, Value * * args, Value &
     NixFloat f2 = state.forceFloat(*args[1], pos);
     if (f2 == 0) throw EvalError(format("division by zero, at %1%") % pos);
 
-    if (args[0]->type == tFloat || args[1]->type == tFloat)
+    if (args[0]->type == tFloat || args[1]->type == tFloat) {
         mkFloat(v, state.forceFloat(*args[0], pos) / state.forceFloat(*args[1], pos));
-    else
-        mkInt(v, state.forceInt(*args[0], pos) / state.forceInt(*args[1], pos));
+    } else {
+        NixInt i1 = state.forceInt(*args[0], pos);
+        NixInt i2 = state.forceInt(*args[1], pos);
+        /* Avoid division overflow as it might raise SIGFPE. */
+        if (i1 == std::numeric_limits<NixInt>::min() && i2 == -1)
+            throw EvalError(format("overflow in integer division, at %1%") % pos);
+        mkInt(v, i1 / i2);
+    }
 }
 
 
@@ -1618,25 +1673,26 @@ static void prim_hashString(EvalState & state, const Pos & pos, Value * * args, 
    ‘null’ or a list containing substring matches. */
 static void prim_match(EvalState & state, const Pos & pos, Value * * args, Value & v)
 {
-    Regex regex(state.forceStringNoCtx(*args[0], pos), true);
+    std::regex regex(state.forceStringNoCtx(*args[0], pos), std::regex::extended);
 
     PathSet context;
-    string s = state.forceString(*args[1], context, pos);
+    const std::string str = state.forceString(*args[1], context, pos);
 
-    Regex::Subs subs;
-    if (!regex.matches(s, subs)) {
+
+    std::smatch match;
+    if (!std::regex_match(str, match, regex)) {
         mkNull(v);
         return;
     }
 
-    unsigned int len = subs.empty() ? 0 : subs.rbegin()->first + 1;
+    // the first match is the whole string
+    const size_t len = match.size() - 1;
     state.mkList(v, len);
-    for (unsigned int n = 0; n < len; ++n) {
-        auto i = subs.find(n);
-        if (i == subs.end())
-            mkNull(*(v.listElems()[n] = state.allocValue()));
+    for (size_t i = 0; i < len; ++i) {
+        if (!match[i+1].matched)
+            mkNull(*(v.listElems()[i] = state.allocValue()));
         else
-            mkString(*(v.listElems()[n] = state.allocValue()), i->second);
+            mkString(*(v.listElems()[i] = state.allocValue()), match[i + 1].str().c_str());
     }
 }
 

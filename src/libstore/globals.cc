@@ -1,12 +1,10 @@
-#include "config.h"
-
 #include "globals.hh"
 #include "util.hh"
 #include "archive.hh"
 
-#include <map>
 #include <algorithm>
-#include <unistd.h>
+#include <map>
+#include <thread>
 
 
 namespace nix {
@@ -25,15 +23,26 @@ Settings settings;
 
 Settings::Settings()
 {
+    nixPrefix = NIX_PREFIX;
+    nixStore = canonPath(getEnv("NIX_STORE_DIR", getEnv("NIX_STORE", NIX_STORE_DIR)));
+    nixDataDir = canonPath(getEnv("NIX_DATA_DIR", NIX_DATA_DIR));
+    nixLogDir = canonPath(getEnv("NIX_LOG_DIR", NIX_LOG_DIR));
+    nixStateDir = canonPath(getEnv("NIX_STATE_DIR", NIX_STATE_DIR));
+    nixConfDir = canonPath(getEnv("NIX_CONF_DIR", NIX_CONF_DIR));
+    nixLibexecDir = canonPath(getEnv("NIX_LIBEXEC_DIR", NIX_LIBEXEC_DIR));
+    nixBinDir = canonPath(getEnv("NIX_BIN_DIR", NIX_BIN_DIR));
+    nixDaemonSocketFile = canonPath(nixStateDir + DEFAULT_SOCKET_PATH);
+
+    // should be set with the other config options, but depends on nixLibexecDir
+#ifdef __APPLE__
+    preBuildHook = nixLibexecDir + "/nix/resolve-system-dependencies";
+#endif
+
     keepFailed = false;
     keepGoing = false;
     tryFallback = false;
     maxBuildJobs = 1;
-    buildCores = 1;
-#ifdef _SC_NPROCESSORS_ONLN
-    long res = sysconf(_SC_NPROCESSORS_ONLN);
-    if (res > 0) buildCores = res;
-#endif
+    buildCores = std::max(1U, std::thread::hardware_concurrency());
     readOnlyMode = false;
     thisSystem = SYSTEM;
     maxSilentTime = 0;
@@ -59,25 +68,9 @@ Settings::Settings()
     lockCPU = getEnv("NIX_AFFINITY_HACK", "1") == "1";
     showTrace = false;
     enableImportNative = false;
-}
-
-
-void Settings::processEnvironment()
-{
-    nixPrefix = NIX_PREFIX;
-    nixStore = canonPath(getEnv("NIX_STORE_DIR", getEnv("NIX_STORE", NIX_STORE_DIR)));
-    nixDataDir = canonPath(getEnv("NIX_DATA_DIR", NIX_DATA_DIR));
-    nixLogDir = canonPath(getEnv("NIX_LOG_DIR", NIX_LOG_DIR));
-    nixStateDir = canonPath(getEnv("NIX_STATE_DIR", NIX_STATE_DIR));
-    nixConfDir = canonPath(getEnv("NIX_CONF_DIR", NIX_CONF_DIR));
-    nixLibexecDir = canonPath(getEnv("NIX_LIBEXEC_DIR", NIX_LIBEXEC_DIR));
-    nixBinDir = canonPath(getEnv("NIX_BIN_DIR", NIX_BIN_DIR));
-    nixDaemonSocketFile = canonPath(nixStateDir + DEFAULT_SOCKET_PATH);
-
-    // should be set with the other config options, but depends on nixLibexecDir
-#ifdef __APPLE__
-    preBuildHook = nixLibexecDir + "/nix/resolve-system-dependencies";
-#endif
+    netrcFile = fmt("%s/%s", nixConfDir, "netrc");
+    caFile = getEnv("NIX_SSL_CERT_FILE", getEnv("SSL_CERT_FILE", "/etc/ssl/certs/ca-certificates.crt"));
+    enableImportFromDerivation = true;
 }
 
 
@@ -156,7 +149,14 @@ int Settings::get(const string & name, int def)
 void Settings::update()
 {
     _get(tryFallback, "build-fallback");
-    _get(maxBuildJobs, "build-max-jobs");
+
+    auto s = get("build-max-jobs", std::string("1"));
+    if (s == "auto")
+        maxBuildJobs = std::max(1U, std::thread::hardware_concurrency());
+    else
+        if (!string2Int(s, maxBuildJobs))
+            throw Error("configuration setting ‘build-max-jobs’ should be ‘auto’ or an integer");
+
     _get(buildCores, "build-cores");
     _get(thisSystem, "system");
     _get(maxSilentTime, "build-max-silent-time");
@@ -179,10 +179,13 @@ void Settings::update()
     _get(envKeepDerivations, "env-keep-derivations");
     _get(sshSubstituterHosts, "ssh-substituter-hosts");
     _get(useSshSubstituter, "use-ssh-substituter");
-    _get(logServers, "log-servers");
     _get(enableImportNative, "allow-unsafe-native-code-during-evaluation");
     _get(useCaseHack, "use-case-hack");
     _get(preBuildHook, "pre-build-hook");
+    _get(keepGoing, "keep-going");
+    _get(keepFailed, "keep-failed");
+    _get(netrcFile, "netrc-file");
+    _get(enableImportFromDerivation, "allow-import-from-derivation");
 }
 
 

@@ -3,6 +3,9 @@
 #include "store-api.hh"
 #include "util.hh"
 #include "nar-info-disk-cache.hh"
+#include "thread-pool.hh"
+#include "json.hh"
+#include "derivations.hh"
 
 #include <future>
 
@@ -283,6 +286,19 @@ bool Store::isValidPath(const Path & storePath)
 }
 
 
+/* Default implementation for stores that only implement
+   queryPathInfoUncached(). */
+bool Store::isValidPathUncached(const Path & path)
+{
+    try {
+        queryPathInfo(path);
+        return true;
+    } catch (InvalidPath &) {
+        return false;
+    }
+}
+
+
 ref<const ValidPathInfo> Store::queryPathInfo(const Path & storePath)
 {
     std::promise<ref<ValidPathInfo>> promise;
@@ -361,6 +377,52 @@ void Store::queryPathInfo(const Path & storePath,
 }
 
 
+PathSet Store::queryValidPaths(const PathSet & paths, bool maybeSubstitute)
+{
+    struct State
+    {
+        size_t left;
+        PathSet valid;
+        std::exception_ptr exc;
+    };
+
+    Sync<State> state_(State{paths.size(), PathSet()});
+
+    std::condition_variable wakeup;
+
+    for (auto & path : paths)
+        queryPathInfo(path,
+            [path, &state_, &wakeup](ref<ValidPathInfo> info) {
+                auto state(state_.lock());
+                state->valid.insert(path);
+                assert(state->left);
+                if (!--state->left)
+                    wakeup.notify_one();
+            },
+            [path, &state_, &wakeup](std::exception_ptr exc) {
+                auto state(state_.lock());
+                try {
+                    std::rethrow_exception(exc);
+                } catch (InvalidPath &) {
+                } catch (...) {
+                    state->exc = exc;
+                }
+                assert(state->left);
+                if (!--state->left)
+                    wakeup.notify_one();
+            });
+
+    while (true) {
+        auto state(state_.lock());
+        if (!state->left) {
+            if (state->exc) std::rethrow_exception(state->exc);
+            return state->valid;
+        }
+        state.wait(wakeup);
+    }
+}
+
+
 /* Return a string accepted by decodeValidPathInfo() that
    registers the specified paths as valid.  Note: it's the
    responsibility of the caller to provide a closure. */
@@ -392,6 +454,64 @@ string Store::makeValidityRegistration(const PathSet & paths,
 }
 
 
+void Store::pathInfoToJSON(JSONPlaceholder & jsonOut, const PathSet & storePaths,
+    bool includeImpureInfo, bool showClosureSize)
+{
+    auto jsonList = jsonOut.list();
+
+    for (auto storePath : storePaths) {
+        auto info = queryPathInfo(storePath);
+        storePath = info->path;
+
+        auto jsonPath = jsonList.object();
+        jsonPath
+            .attr("path", storePath)
+            .attr("narHash", info->narHash.to_string())
+            .attr("narSize", info->narSize);
+
+        {
+            auto jsonRefs = jsonPath.list("references");
+            for (auto & ref : info->references)
+                jsonRefs.elem(ref);
+        }
+
+        if (info->ca != "")
+            jsonPath.attr("ca", info->ca);
+
+        if (showClosureSize)
+            jsonPath.attr("closureSize", getClosureSize(storePath));
+
+        if (!includeImpureInfo) continue;
+
+        if (info->deriver != "")
+            jsonPath.attr("deriver", info->deriver);
+
+        if (info->registrationTime)
+            jsonPath.attr("registrationTime", info->registrationTime);
+
+        if (info->ultimate)
+            jsonPath.attr("ultimate", info->ultimate);
+
+        if (!info->sigs.empty()) {
+            auto jsonSigs = jsonPath.list("signatures");
+            for (auto & sig : info->sigs)
+                jsonSigs.elem(sig);
+        }
+    }
+}
+
+
+unsigned long long Store::getClosureSize(const Path & storePath)
+{
+    unsigned long long totalSize = 0;
+    PathSet closure;
+    computeFSClosure(storePath, closure, false, false);
+    for (auto & p : closure)
+        totalSize += queryPathInfo(p)->narSize;
+    return totalSize;
+}
+
+
 const Store::Stats & Store::getStats()
 {
     {
@@ -403,14 +523,49 @@ const Store::Stats & Store::getStats()
 
 
 void copyStorePath(ref<Store> srcStore, ref<Store> dstStore,
-    const Path & storePath, bool repair)
+    const Path & storePath, bool repair, bool dontCheckSigs)
 {
     auto info = srcStore->queryPathInfo(storePath);
 
     StringSink sink;
     srcStore->narFromPath({storePath}, sink);
 
-    dstStore->addToStore(*info, *sink.s, repair);
+    if (srcStore->isTrusted())
+        dontCheckSigs = true;
+
+    if (!info->narHash && dontCheckSigs) {
+        auto info2 = make_ref<ValidPathInfo>(*info);
+        info2->narHash = hashString(htSHA256, *sink.s);
+        info = info2;
+    }
+
+    dstStore->addToStore(*info, sink.s, repair, dontCheckSigs);
+}
+
+
+void copyClosure(ref<Store> srcStore, ref<Store> dstStore,
+    const PathSet & storePaths, bool repair, bool dontCheckSigs)
+{
+    PathSet closure;
+    for (auto & path : storePaths)
+        srcStore->computeFSClosure(path, closure);
+
+    // FIXME: use copyStorePaths()
+
+    PathSet valid = dstStore->queryValidPaths(closure);
+
+    if (valid.size() == closure.size()) return;
+
+    Paths sorted = srcStore->topoSortPaths(closure);
+
+    Paths missing;
+    for (auto i = sorted.rbegin(); i != sorted.rend(); ++i)
+        if (!valid.count(*i)) missing.push_back(*i);
+
+    printMsg(lvlDebug, format("copying %1% missing paths") % missing.size());
+
+    for (auto & i : missing)
+        copyStorePath(srcStore, dstStore, i, repair, dontCheckSigs);
 }
 
 
@@ -523,6 +678,12 @@ Strings ValidPathInfo::shortRefs() const
 }
 
 
+std::string makeFixedOutputCA(bool recursive, const Hash & hash)
+{
+    return "fixed:" + (recursive ? (std::string) "r:" : "") + hash.to_string();
+}
+
+
 }
 
 
@@ -536,7 +697,7 @@ namespace nix {
 RegisterStoreImplementation::Implementations * RegisterStoreImplementation::implementations = 0;
 
 
-ref<Store> openStoreAt(const std::string & uri_)
+ref<Store> openStore(const std::string & uri_)
 {
     auto uri(uri_);
     Store::Params params;
@@ -549,7 +710,11 @@ ref<Store> openStoreAt(const std::string & uri_)
         }
         uri = uri_.substr(0, q);
     }
+    return openStore(uri, params);
+}
 
+ref<Store> openStore(const std::string & uri, const Store::Params & params)
+{
     for (auto fun : *RegisterStoreImplementation::implementations) {
         auto store = fun(uri, params);
         if (store) return ref<Store>(store);
@@ -559,9 +724,22 @@ ref<Store> openStoreAt(const std::string & uri_)
 }
 
 
-ref<Store> openStore()
+StoreType getStoreType(const std::string & uri, const std::string & stateDir)
 {
-    return openStoreAt(getEnv("NIX_REMOTE"));
+    if (uri == "daemon") {
+        return tDaemon;
+    } else if (uri == "local") {
+        return tLocal;
+    } else if (uri == "") {
+        if (access(stateDir.c_str(), R_OK | W_OK) == 0)
+            return tLocal;
+        else if (pathExists(settings.nixDaemonSocketFile))
+            return tDaemon;
+        else
+            return tLocal;
+    } else {
+        return tOther;
+    }
 }
 
 
@@ -569,26 +747,14 @@ static RegisterStoreImplementation regStore([](
     const std::string & uri, const Store::Params & params)
     -> std::shared_ptr<Store>
 {
-    enum { mDaemon, mLocal, mAuto } mode;
-
-    if (uri == "daemon") mode = mDaemon;
-    else if (uri == "local") mode = mLocal;
-    else if (uri == "") mode = mAuto;
-    else return 0;
-
-    if (mode == mAuto) {
-        auto stateDir = get(params, "state", settings.nixStateDir);
-        if (access(stateDir.c_str(), R_OK | W_OK) == 0)
-            mode = mLocal;
-        else if (pathExists(settings.nixDaemonSocketFile))
-            mode = mDaemon;
-        else
-            mode = mLocal;
+    switch (getStoreType(uri, get(params, "state", settings.nixStateDir))) {
+        case tDaemon:
+            return std::shared_ptr<Store>(std::make_shared<UDSRemoteStore>(params));
+        case tLocal:
+            return std::shared_ptr<Store>(std::make_shared<LocalStore>(params));
+        default:
+            return nullptr;
     }
-
-    return mode == mDaemon
-        ? std::shared_ptr<Store>(std::make_shared<RemoteStore>(params))
-        : std::shared_ptr<Store>(std::make_shared<LocalStore>(params));
 });
 
 
@@ -609,7 +775,7 @@ std::list<ref<Store>> getDefaultSubstituters()
     auto addStore = [&](const std::string & uri) {
         if (done.count(uri)) return;
         done.insert(uri);
-        state->stores.push_back(openStoreAt(uri));
+        state->stores.push_back(openStore(uri));
     };
 
     for (auto uri : settings.get("substituters", Strings()))
@@ -624,6 +790,45 @@ std::list<ref<Store>> getDefaultSubstituters()
     state->done = true;
 
     return state->stores;
+}
+
+
+void copyPaths(ref<Store> from, ref<Store> to, const PathSet & storePaths, bool substitute)
+{
+    PathSet valid = to->queryValidPaths(storePaths, substitute);
+
+    PathSet missing;
+    for (auto & path : storePaths)
+        if (!valid.count(path)) missing.insert(path);
+
+    std::string copiedLabel = "copied";
+
+    logger->setExpected(copiedLabel, missing.size());
+
+    ThreadPool pool;
+
+    processGraph<Path>(pool,
+        PathSet(missing.begin(), missing.end()),
+
+        [&](const Path & storePath) {
+            if (to->isValidPath(storePath)) return PathSet();
+            return from->queryPathInfo(storePath)->references;
+        },
+
+        [&](const Path & storePath) {
+            checkInterrupt();
+
+            if (!to->isValidPath(storePath)) {
+                Activity act(*logger, lvlInfo, format("copying ‘%s’...") % storePath);
+
+                copyStorePath(from, to, storePath);
+
+                logger->incProgress(copiedLabel);
+            } else
+                logger->incExpected(copiedLabel, -1);
+        });
+
+    pool.process();
 }
 
 

@@ -18,7 +18,8 @@
 <refsection><title>Description</title>
 
 <para>A number of persistent settings of Nix are stored in the file
-<filename><replaceable>sysconfdir</replaceable>/nix/nix.conf</filename>.
+<filename><replaceable>sysconfdir</replaceable>/nix/nix.conf</filename> or
+<filename>$NIX_CONF_DIR/nix.conf</filename> if <envar>NIX_CONF_DIR</envar> is set.
 This file is a list of <literal><replaceable>name</replaceable> =
 <replaceable>value</replaceable></literal> pairs, one per line.
 Comments start with a <literal>#</literal> character.  Here is an example
@@ -100,9 +101,9 @@ flag, e.g. <literal>--option gc-keep-outputs false</literal>.</para>
 
     <listitem><para>This option defines the maximum number of jobs
     that Nix will try to build in parallel.  The default is
-    <literal>1</literal>.  You should generally set it to the number
-    of CPUs in your system (e.g., <literal>2</literal> on an Athlon 64
-    X2).  It can be overridden using the <option
+    <literal>1</literal>. The special value <literal>auto</literal>
+    causes Nix to use the number of CPUs in your system.  It can be
+    overridden using the <option
     linkend='opt-max-jobs'>--max-jobs</option> (<option>-j</option>)
     command line switch.</para></listitem>
 
@@ -268,7 +269,12 @@ flag, e.g. <literal>--option gc-keep-outputs false</literal>.</para>
     to mount a path in a different location in the sandbox; for
     instance, <literal>/bin=/nix-bin</literal> will mount the path
     <literal>/nix-bin</literal> as <literal>/bin</literal> inside the
-    sandbox.</para>
+    sandbox. If <replaceable>source</replaceable> is followed by
+    <literal>?</literal>, then it is not an error if
+    <replaceable>source</replaceable> does not exist; for example,
+    <literal>/dev/nvidiactl?</literal> specifies that
+    <filename>/dev/nvidiactl</filename> will only be mounted in the
+    sandbox if it exists in the host filesystem.</para>
 
     <para>Depending on how Nix was built, the default value for this option
     may be empty or provide <filename>/bin/sh</filename> as a
@@ -424,6 +430,29 @@ flag, e.g. <literal>--option gc-keep-outputs false</literal>.</para>
   </varlistentry>
 
 
+  <varlistentry><term><literal>netrc-file</literal></term>
+
+    <listitem><para>If set to an absolute path to a <filename>netrc</filename>
+    file, Nix will use the HTTP authentication credentials in this file when
+    trying to download from a remote host through HTTP or HTTPS. Defaults to
+    <filename>$NIX_CONF_DIR/netrc</filename>.</para>
+
+    <para>The <filename>netrc</filename> file consists of a list of
+    accounts in the following format:
+
+<screen>
+machine <replaceable>my-machine</replaceable>
+login <replaceable>my-username</replaceable>
+password <replaceable>my-password</replaceable>
+</screen>
+
+    For the exact syntax, see <link
+    xlink:href="https://ec.haxx.se/usingcurl-netrc.html">the
+    <literal>curl</literal> documentation.</link></para></listitem>
+
+  </varlistentry>
+
+
   <varlistentry><term><literal>system</literal></term>
 
     <listitem><para>This option specifies the canonical Nix system
@@ -477,20 +506,6 @@ flag, e.g. <literal>--option gc-keep-outputs false</literal>.</para>
       the binary cache substituter.  It corresponds to
       <command>curl</command>’s <option>--connect-timeout</option>
       option.</para>
-
-    </listitem>
-
-  </varlistentry>
-
-
-  <varlistentry xml:id="conf-log-servers"><term><literal>log-servers</literal></term>
-
-    <listitem>
-
-      <para>A list of URL prefixes (such as
-      <literal>http://hydra.nixos.org/log</literal>) from which
-      <command>nix-store -l</command> will try to fetch build logs if
-      they’re not available locally.</para>
 
     </listitem>
 
@@ -611,6 +626,16 @@ flag, e.g. <literal>--option gc-keep-outputs false</literal>.</para>
     <literal>tmpfs</literal> in
     <citerefentry><refentrytitle>mount</refentrytitle><manvolnum>8</manvolnum></citerefentry>. The
     default is <literal>50%</literal>.</para></listitem>
+
+  </varlistentry>
+
+
+  <varlistentry xml:id="conf-allow-import-from-derivation"><term><literal>allow-import-from-derivation</literal></term>
+
+    <listitem><para>By default, Nix allows you to <function>import</function> from a derivation,
+    allowing building at evaluation time. With this option set to false, Nix will throw an error
+    when evaluating an expression that uses this feature, allowing users to ensure their evaluation
+    will not require any builds to take place.</para></listitem>
 
   </varlistentry>
 

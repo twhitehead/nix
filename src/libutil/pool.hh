@@ -137,14 +137,20 @@ public:
         } catch (...) {
             auto state_(state.lock());
             state_->inUse--;
+            wakeup.notify_one();
             throw;
         }
     }
 
-    unsigned int count()
+    size_t count()
     {
         auto state_(state.lock());
         return state_->idle.size() + state_->inUse;
+    }
+
+    size_t capacity()
+    {
+        return state.lock()->max;
     }
 };
 

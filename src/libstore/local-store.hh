@@ -21,9 +21,6 @@ namespace nix {
 const int nixSchemaVersion = 10;
 
 
-extern string drvsLogDir;
-
-
 struct Derivation;
 
 
@@ -102,7 +99,7 @@ public:
 
     bool isValidPathUncached(const Path & path) override;
 
-    PathSet queryValidPaths(const PathSet & paths) override;
+    PathSet queryValidPaths(const PathSet & paths, bool maybeSubstitute = false) override;
 
     PathSet queryAllValidPaths() override;
 
@@ -125,12 +122,13 @@ public:
     void querySubstitutablePathInfos(const PathSet & paths,
         SubstitutablePathInfos & infos) override;
 
-    void addToStore(const ValidPathInfo & info, const std::string & nar,
-        bool repair, bool dontCheckSigs) override;
+    void addToStore(const ValidPathInfo & info, const ref<std::string> & nar,
+        bool repair, bool dontCheckSigs,
+        std::shared_ptr<FSAccessor> accessor) override;
 
     Path addToStore(const string & name, const Path & srcPath,
-        bool recursive = true, HashType hashAlgo = htSHA256,
-        PathFilter & filter = defaultPathFilter, bool repair = false) override;
+        bool recursive, HashType hashAlgo,
+        PathFilter & filter, bool repair) override;
 
     /* Like addToStore(), but the contents of the path are contained
        in `dump', which is either a NAR serialisation (if recursive ==
@@ -140,7 +138,7 @@ public:
         bool recursive = true, HashType hashAlgo = htSHA256, bool repair = false);
 
     Path addTextToStore(const string & name, const string & s,
-        const PathSet & references, bool repair = false) override;
+        const PathSet & references, bool repair) override;
 
     void buildPaths(const PathSet & paths, BuildMode buildMode) override;
 

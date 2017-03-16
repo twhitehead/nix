@@ -91,13 +91,9 @@ static void printValue(std::ostream & str, std::set<const Value *> & active, con
         break;
     case tAttrs: {
         str << "{ ";
-        typedef std::map<string, Value *> Sorted;
-        Sorted sorted;
-        for (auto & i : *v.attrs)
-            sorted[i.name] = i.value;
-        for (auto & i : sorted) {
-            str << i.first << " = ";
-            printValue(str, active, *i.second);
+        for (auto & i : v.attrs->lexicographicOrder()) {
+            str << i->name << " = ";
+            printValue(str, active, *i->value);
             str << "; ";
         }
         str << "}";
@@ -295,6 +291,8 @@ EvalState::EvalState(const Strings & _searchPath, ref<Store> store)
     , sToString(symbols.create("__toString"))
     , sRight(symbols.create("right"))
     , sWrong(symbols.create("wrong"))
+    , sStructuredAttrs(symbols.create("__structuredAttrs"))
+    , sBuilder(symbols.create("builder"))
     , store(store)
     , baseEnv(allocEnv(128))
     , staticBaseEnv(false, 0)

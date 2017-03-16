@@ -114,7 +114,6 @@ if test -z "$$1"; then
 fi
 ])
 
-NEED_PROG(curl, curl)
 NEED_PROG(bash, bash)
 NEED_PROG(patch, patch)
 AC_PATH_PROG(xmllint, xmllint, false)
@@ -128,8 +127,8 @@ NEED_PROG(bzip2, bzip2)
 NEED_PROG(gzip, gzip)
 NEED_PROG(xz, xz)
 AC_PATH_PROG(dot, dot)
-AC_PATH_PROG(dblatex, dblatex)
 AC_PATH_PROG(pv, pv, pv)
+NEED_PROG(bro, bro)
 
 
 # Test that Perl has the open/fork feature (Perl 5.8.0 and beyond).
@@ -214,7 +213,7 @@ if test "$gc" = yes; then
 fi
 
 
-# Check for the required Perl dependencies (DBI, DBD::SQLite and WWW::Curl).
+# Check for the required Perl dependencies (DBI, DBD::SQLite).
 perlFlags="-I$perllibdir"
 
 AC_ARG_WITH(dbi, AC_HELP_STRING([--with-dbi=PATH],
@@ -225,21 +224,10 @@ AC_ARG_WITH(dbd-sqlite, AC_HELP_STRING([--with-dbd-sqlite=PATH],
   [prefix of the Perl DBD::SQLite library]),
   perlFlags="$perlFlags -I$withval")
 
-AC_ARG_WITH(www-curl, AC_HELP_STRING([--with-www-curl=PATH],
-  [prefix of the Perl WWW::Curl library]),
-  perlFlags="$perlFlags -I$withval")
-
 AC_MSG_CHECKING([whether DBD::SQLite works])
 if ! $perl $perlFlags -e 'use DBI; use DBD::SQLite;' 2>&5; then
     AC_MSG_RESULT(no)
     AC_MSG_FAILURE([The Perl modules DBI and/or DBD::SQLite are missing.])
-fi
-AC_MSG_RESULT(yes)
-
-AC_MSG_CHECKING([whether WWW::Curl works])
-if ! $perl $perlFlags -e 'use WWW::Curl;' 2>&5; then
-    AC_MSG_RESULT(no)
-    AC_MSG_FAILURE([The Perl module WWW::Curl is missing.])
 fi
 AC_MSG_RESULT(yes)
 
@@ -277,7 +265,7 @@ AC_CHECK_FUNCS([setresuid setreuid lchown])
 
 
 # Nice to have, but not essential.
-AC_CHECK_FUNCS([strsignal posix_fallocate nanosleep sysconf])
+AC_CHECK_FUNCS([strsignal posix_fallocate sysconf])
 
 
 # This is needed if bzip2 is a static library, and the Nix libraries

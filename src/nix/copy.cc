@@ -38,41 +38,19 @@ struct CmdCopy : StorePathsCommand
         };
     }
 
-    void run(ref<Store> store, Paths storePaths) override
+    ref<Store> createStore() override
+    {
+        return srcUri.empty() ? StoreCommand::createStore() : openStore(srcUri);
+    }
+
+    void run(ref<Store> srcStore, Paths storePaths) override
     {
         if (srcUri.empty() && dstUri.empty())
             throw UsageError("you must pass ‘--from’ and/or ‘--to’");
 
-        ref<Store> srcStore = srcUri.empty() ? store : openStoreAt(srcUri);
-        ref<Store> dstStore = dstUri.empty() ? store : openStoreAt(dstUri);
+        ref<Store> dstStore = dstUri.empty() ? openStore() : openStore(dstUri);
 
-        std::string copiedLabel = "copied";
-
-        logger->setExpected(copiedLabel, storePaths.size());
-
-        ThreadPool pool;
-
-        processGraph<Path>(pool,
-            PathSet(storePaths.begin(), storePaths.end()),
-
-            [&](const Path & storePath) {
-                return srcStore->queryPathInfo(storePath)->references;
-            },
-
-            [&](const Path & storePath) {
-                checkInterrupt();
-
-                if (!dstStore->isValidPath(storePath)) {
-                    Activity act(*logger, lvlInfo, format("copying ‘%s’...") % storePath);
-
-                    copyStorePath(srcStore, dstStore, storePath);
-
-                    logger->incProgress(copiedLabel);
-                } else
-                    logger->incExpected(copiedLabel, -1);
-            });
-
-        pool.process();
+        copyPaths(srcStore, dstStore, PathSet(storePaths.begin(), storePaths.end()));
     }
 };
 

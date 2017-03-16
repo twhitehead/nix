@@ -19,15 +19,21 @@ private:
 
     std::string compression;
 
+    bool writeNARListing;
+
 protected:
 
     BinaryCacheStore(const Params & params);
 
     [[noreturn]] void notImpl();
 
+public:
+
     virtual bool fileExists(const std::string & path) = 0;
 
-    virtual void upsertFile(const std::string & path, const std::string & data) = 0;
+    virtual void upsertFile(const std::string & path,
+        const std::string & data,
+        const std::string & mimeType) = 0;
 
     /* Return the contents of the specified file, or null if it
        doesn't exist. */
@@ -36,6 +42,8 @@ protected:
         std::function<void(std::exception_ptr exc)> failure) = 0;
 
     std::shared_ptr<std::string> getFile(const std::string & path);
+
+protected:
 
     bool wantMassQuery_ = false;
     int priority = 50;
@@ -54,9 +62,6 @@ public:
 
     bool isValidPathUncached(const Path & path) override;
 
-    PathSet queryValidPaths(const PathSet & paths) override
-    { notImpl(); }
-
     PathSet queryAllValidPaths() override
     { notImpl(); }
 
@@ -68,9 +73,6 @@ public:
         PathSet & referrers) override
     { notImpl(); }
 
-    PathSet queryValidDerivers(const Path & path) override
-    { return {}; }
-
     PathSet queryDerivationOutputs(const Path & path) override
     { notImpl(); }
 
@@ -80,32 +82,26 @@ public:
     Path queryPathFromHashPart(const string & hashPart) override
     { notImpl(); }
 
-    PathSet querySubstitutablePaths(const PathSet & paths) override
-    { return {}; }
-
-    void querySubstitutablePathInfos(const PathSet & paths,
-        SubstitutablePathInfos & infos) override
-    { }
-
     bool wantMassQuery() override { return wantMassQuery_; }
 
-    void addToStore(const ValidPathInfo & info, const std::string & nar,
-        bool repair = false, bool dontCheckSigs = false) override;
+    void addToStore(const ValidPathInfo & info, const ref<std::string> & nar,
+        bool repair, bool dontCheckSigs,
+        std::shared_ptr<FSAccessor> accessor) override;
 
     Path addToStore(const string & name, const Path & srcPath,
-        bool recursive = true, HashType hashAlgo = htSHA256,
-        PathFilter & filter = defaultPathFilter, bool repair = false) override;
+        bool recursive, HashType hashAlgo,
+        PathFilter & filter, bool repair) override;
 
     Path addTextToStore(const string & name, const string & s,
-        const PathSet & references, bool repair = false) override;
+        const PathSet & references, bool repair) override;
 
     void narFromPath(const Path & path, Sink & sink) override;
 
-    void buildPaths(const PathSet & paths, BuildMode buildMode = bmNormal) override
+    void buildPaths(const PathSet & paths, BuildMode buildMode) override
     { notImpl(); }
 
     BuildResult buildDerivation(const Path & drvPath, const BasicDerivation & drv,
-        BuildMode buildMode = bmNormal) override
+        BuildMode buildMode) override
     { notImpl(); }
 
     void ensurePath(const Path & path) override
@@ -117,25 +113,18 @@ public:
     void addIndirectRoot(const Path & path) override
     { notImpl(); }
 
-    void syncWithGC() override
-    { }
-
     Roots findRoots() override
     { notImpl(); }
 
     void collectGarbage(const GCOptions & options, GCResults & results) override
     { notImpl(); }
 
-    void optimiseStore() override
-    { }
-
-    bool verifyStore(bool checkContents, bool repair) override
-    { return true; }
-
     ref<FSAccessor> getFSAccessor() override;
 
     void addSignatures(const Path & storePath, const StringSet & sigs) override
     { notImpl(); }
+
+    std::shared_ptr<std::string> getBuildLog(const Path & path) override;
 
 };
 

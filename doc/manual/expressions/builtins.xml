@@ -210,6 +210,35 @@ if builtins ? getEnv then builtins.getEnv "PATH" else ""</programlisting>
 
   </varlistentry>
 
+  <varlistentry><term><function>builtins.match</function>
+  <replaceable>regex</replaceable> <replaceable>str</replaceable></term>
+
+  <listitem><para>Returns a list if
+    <replaceable>regex</replaceable> matches
+    <replaceable>str</replaceable> precisely, otherwise returns <literal>null</literal>.
+    Each item in the list is a regex group.
+
+<programlisting>
+builtins.match "ab" "abc"
+</programlisting>
+
+Evaluates to <literal>null</literal>.
+
+<programlisting>
+builtins.match "abc" "abc"
+</programlisting>
+
+Evaluates to <literal>[ ]</literal>.
+
+<programlisting>
+builtins.match "a(b)(c)" "abc"
+</programlisting>
+
+Evaluates to <literal>[ "b" "c" ]</literal>.
+
+
+  </para></listitem>
+  </varlistentry>
 
   <varlistentry><term><function>builtins.elem</function>
   <replaceable>x</replaceable> <replaceable>xs</replaceable></term>
@@ -994,10 +1023,17 @@ in foo</programlisting>
 
     <listitem><para>Convert the expression
     <replaceable>e</replaceable> to a string.
-    <replaceable>e</replaceable> can be a string (in which case
-    <function>toString</function> is a no-op), a path (e.g.,
-    <literal>toString /foo/bar</literal> yields
-    <literal>"/foo/bar"</literal> or a set containing <literal>{ __toString = self: ...; }</literal>.</para></listitem>
+    <replaceable>e</replaceable> can be:</para>
+    <itemizedlist>
+      <listitem><para>A string (in which case the string is returned unmodified).</para></listitem>
+      <listitem><para>A path (e.g., <literal>toString /foo/bar</literal> yields <literal>"/foo/bar"</literal>.</para></listitem>
+      <listitem><para>A set containing <literal>{ __toString = self: ...; }</literal>.</para></listitem>
+      <listitem><para>An integer.</para></listitem>
+      <listitem><para>A list, in which case the string representations of its elements are joined with spaces.</para></listitem>
+      <listitem><para>A Boolean (<literal>false</literal> yields <literal>""</literal>, <literal>true</literal> yields <literal>"1"</literal>.</para></listitem>
+      <listitem><para><literal>null</literal>, which yields the empty string.</para></listitem>
+    </itemizedlist>
+    </listitem>
 
   </varlistentry>
 

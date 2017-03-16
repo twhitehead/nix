@@ -5,6 +5,7 @@
 #include "crypto.hh"
 #include "lru-cache.hh"
 #include "sync.hh"
+#include "globals.hh"
 
 #include <atomic>
 #include <limits>
@@ -21,6 +22,7 @@ struct Derivation;
 class FSAccessor;
 class NarInfoDiskCache;
 class Store;
+class JSONPlaceholder;
 
 
 /* Size of the hash part of store paths, in base-32 characters. */
@@ -126,7 +128,7 @@ struct ValidPathInfo
        of an output path of a derivation were actually produced by
        that derivation. In the intensional model, we have to trust
        that a particular output path was produced by a derivation; the
-       path name then implies the contents.)
+       path then implies the contents.)
 
        Ideally, the content-addressability assertion would just be a
        Boolean, and the store path would be computed from
@@ -188,6 +190,9 @@ enum BuildMode { bmNormal, bmRepair, bmCheck, bmHash };
 
 struct BuildResult
 {
+    /* Note: don't remove status codes, and only add new status codes
+       at the end of the list, to prevent client/server
+       incompatibilities in the nix-store --serve protocol. */
     enum Status {
         Built = 0,
         Substituted,
@@ -196,6 +201,7 @@ struct BuildResult
         InputRejected,
         OutputRejected,
         TransientFailure, // possibly transient
+        CachedFailure, // no longer used
         TimedOut,
         MiscFailure,
         DependencyFailed,
@@ -203,7 +209,20 @@ struct BuildResult
         NotDeterministic,
     } status = MiscFailure;
     std::string errorMsg;
-    //time_t startTime = 0, stopTime = 0;
+
+    /* How many times this build was performed. */
+    unsigned int timesBuilt = 0;
+
+    /* If timesBuilt > 1, whether some builds did not produce the same
+       result. (Note that 'isNonDeterministic = false' does not mean
+       the build is deterministic, just that we don't have evidence of
+       non-determinism.) */
+    bool isNonDeterministic = false;
+
+    /* The start/stop times of the build (or one of the rounds, if it
+       was repeated). */
+    time_t startTime = 0, stopTime = 0;
+
     bool success() {
         return status == Built || status == Substituted || status == AlreadyValid;
     }
@@ -301,12 +320,14 @@ public:
 
 protected:
 
-    virtual bool isValidPathUncached(const Path & path) = 0;
+    virtual bool isValidPathUncached(const Path & path);
 
 public:
 
-    /* Query which of the given paths is valid. */
-    virtual PathSet queryValidPaths(const PathSet & paths) = 0;
+    /* Query which of the given paths is valid. Optionally, try to
+       substitute missing paths. */
+    virtual PathSet queryValidPaths(const PathSet & paths,
+        bool maybeSubstitute = false);
 
     /* Query the set of all valid paths. Note that for some store
        backends, the name part of store paths may be omitted
@@ -341,7 +362,7 @@ public:
        output.  (Note that the result of `queryDeriver()' is the
        derivation that was actually used to produce `path', which may
        not exist anymore.) */
-    virtual PathSet queryValidDerivers(const Path & path) = 0;
+    virtual PathSet queryValidDerivers(const Path & path) { return {}; };
 
     /* Query the outputs of the derivation denoted by `path'. */
     virtual PathSet queryDerivationOutputs(const Path & path) = 0;
@@ -354,19 +375,20 @@ public:
     virtual Path queryPathFromHashPart(const string & hashPart) = 0;
 
     /* Query which of the given paths have substitutes. */
-    virtual PathSet querySubstitutablePaths(const PathSet & paths) = 0;
+    virtual PathSet querySubstitutablePaths(const PathSet & paths) { return {}; };
 
     /* Query substitute info (i.e. references, derivers and download
        sizes) of a set of paths.  If a path does not have substitute
        info, it's omitted from the resulting ‘infos’ map. */
     virtual void querySubstitutablePathInfos(const PathSet & paths,
-        SubstitutablePathInfos & infos) = 0;
+        SubstitutablePathInfos & infos) { return; };
 
     virtual bool wantMassQuery() { return false; }
 
     /* Import a path into the store. */
-    virtual void addToStore(const ValidPathInfo & info, const std::string & nar,
-        bool repair = false, bool dontCheckSigs = false) = 0;
+    virtual void addToStore(const ValidPathInfo & info, const ref<std::string> & nar,
+        bool repair = false, bool dontCheckSigs = false,
+        std::shared_ptr<FSAccessor> accessor = 0) = 0;
 
     /* Copy the contents of a path to the store and register the
        validity the resulting path.  The resulting path is returned.
@@ -434,7 +456,7 @@ public:
          permanent root and sees our's.
 
        In either case the permanent root is seen by the collector. */
-    virtual void syncWithGC() = 0;
+    virtual void syncWithGC() { };
 
     /* Find the roots of the garbage collector.  Each root is a pair
        (link, storepath) where `link' is the path of the symlink
@@ -450,13 +472,26 @@ public:
     string makeValidityRegistration(const PathSet & paths,
         bool showDerivers, bool showHash);
 
+    /* Write a JSON representation of store path metadata, such as the
+       hash and the references. If ‘includeImpureInfo’ is true,
+       variable elements such as the registration time are
+       included. If ‘showClosureSize’ is true, the closure size of
+       each path is included. */
+    void pathInfoToJSON(JSONPlaceholder & jsonOut, const PathSet & storePaths,
+        bool includeImpureInfo, bool showClosureSize);
+
+    /* Return the size of the closure of the specified path, that is,
+       the sum of the size of the NAR serialisation of each path in
+       the closure. */
+    unsigned long long getClosureSize(const Path & storePath);
+
     /* Optimise the disk space usage of the Nix store by hard-linking files
        with the same contents. */
-    virtual void optimiseStore() = 0;
+    virtual void optimiseStore() { };
 
     /* Check the integrity of the Nix store.  Returns true if errors
        remain. */
-    virtual bool verifyStore(bool checkContents, bool repair) = 0;
+    virtual bool verifyStore(bool checkContents, bool repair) { return false; };
 
     /* Return an object to access files in the Nix store. */
     virtual ref<FSAccessor> getFSAccessor() = 0;
@@ -471,15 +506,19 @@ public:
        ensurePath(). */
     Derivation derivationFromPath(const Path & drvPath);
 
-    /* Place in `paths' the set of all store paths in the file system
+    /* Place in `out' the set of all store paths in the file system
        closure of `storePath'; that is, all paths than can be directly
-       or indirectly reached from it.  `paths' is not cleared.  If
+       or indirectly reached from it.  `out' is not cleared.  If
        `flipDirection' is true, the set of paths that can reach
        `storePath' is returned; that is, the closures under the
        `referrers' relation instead of the `references' relation is
        returned. */
+    virtual void computeFSClosure(const PathSet & paths,
+        PathSet & out, bool flipDirection = false,
+        bool includeOutputs = false, bool includeDerivers = false);
+
     void computeFSClosure(const Path & path,
-        PathSet & paths, bool flipDirection = false,
+        PathSet & out, bool flipDirection = false,
         bool includeOutputs = false, bool includeDerivers = false);
 
     /* Given a set of paths that are to be built, return the set of
@@ -525,6 +564,15 @@ public:
 
     const Stats & getStats();
 
+    /* Whether this store paths from this store can be imported even
+       if they lack a signature. */
+    virtual bool isTrusted() { return false; }
+
+    /* Return the build log of the specified store path, if available,
+       or null otherwise. */
+    virtual std::shared_ptr<std::string> getBuildLog(const Path & path)
+    { return nullptr; }
+
 protected:
 
     Stats stats;
@@ -532,12 +580,13 @@ protected:
 };
 
 
-class LocalFSStore : public Store
+class LocalFSStore : public virtual Store
 {
 public:
     const Path rootDir;
     const Path stateDir;
     const Path logDir;
+    const static string drvsLogDir;
 
     LocalFSStore(const Params & params);
 
@@ -554,6 +603,8 @@ public:
     {
         return getRealStoreDir() + "/" + baseNameOf(storePath);
     }
+
+    std::shared_ptr<std::string> getBuildLog(const Path & path) override;
 };
 
 
@@ -571,7 +622,12 @@ void checkStoreName(const string & name);
 
 /* Copy a path from one store to another. */
 void copyStorePath(ref<Store> srcStore, ref<Store> dstStore,
-    const Path & storePath, bool repair = false);
+    const Path & storePath, bool repair = false, bool dontCheckSigs = false);
+
+
+/* Copy the closure of the specified paths from one store to another. */
+void copyClosure(ref<Store> srcStore, ref<Store> dstStore,
+    const PathSet & storePaths, bool repair = false, bool dontCheckSigs = false);
 
 
 /* Remove the temporary roots file for this process.  Any temporary
@@ -594,12 +650,21 @@ void removeTempRoots();
    If ‘uri’ is empty, it defaults to ‘direct’ or ‘daemon’ depending on
    whether the user has write access to the local Nix store/database.
    set to true *unless* you're going to collect garbage. */
-ref<Store> openStoreAt(const std::string & uri);
+ref<Store> openStore(const std::string & uri = getEnv("NIX_REMOTE"));
+
+ref<Store> openStore(const std::string & uri, const Store::Params & params);
 
 
-/* Open the store indicated by the ‘NIX_REMOTE’ environment variable. */
-ref<Store> openStore();
+void copyPaths(ref<Store> from, ref<Store> to, const PathSet & storePaths, bool substitute = false);
 
+enum StoreType {
+    tDaemon,
+    tLocal,
+    tOther
+};
+
+
+StoreType getStoreType(const std::string & uri = getEnv("NIX_REMOTE"), const std::string & stateDir = settings.nixStateDir);
 
 /* Return the default substituter stores, defined by the
    ‘substituters’ option and various legacy options like
@@ -632,6 +697,11 @@ string showPaths(const PathSet & paths);
 
 ValidPathInfo decodeValidPathInfo(std::istream & str,
     bool hashGiven = false);
+
+
+/* Compute the content-addressability assertion (ValidPathInfo::ca)
+   for paths created by makeFixedOutputPath() / addToStore(). */
+std::string makeFixedOutputCA(bool recursive, const Hash & hash);
 
 
 MakeError(SubstError, Error)

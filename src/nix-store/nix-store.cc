@@ -9,7 +9,6 @@
 #include "util.hh"
 #include "worker-protocol.hh"
 #include "xmlgraph.hh"
-#include "compression.hh"
 
 #include <iostream>
 #include <algorithm>
@@ -424,10 +423,9 @@ static void opQuery(Strings opFlags, Strings opArgs)
         case qRoots: {
             PathSet referrers;
             for (auto & i : opArgs) {
-                PathSet paths = maybeUseOutputs(store->followLinksToStorePath(i), useOutput, forceRealise);
-                for (auto & j : paths)
-                    store->computeFSClosure(j, referrers, true,
-                        settings.gcKeepOutputs, settings.gcKeepDerivations);
+                store->computeFSClosure(
+                    maybeUseOutputs(store->followLinksToStorePath(i), useOutput, forceRealise),
+                    referrers, true, settings.gcKeepOutputs, settings.gcKeepDerivations);
             }
             Roots roots = store->findRoots();
             for (auto & i : roots)
@@ -483,58 +481,12 @@ static void opReadLog(Strings opFlags, Strings opArgs)
 
     RunPager pager;
 
-    // FIXME: move getting logs into Store.
-    auto store2 = std::dynamic_pointer_cast<LocalFSStore>(store);
-    if (!store2) throw Error(format("store ‘%s’ does not support reading logs") % store->getUri());
-
     for (auto & i : opArgs) {
-        Path path = useDeriver(store->followLinksToStorePath(i));
-
-        string baseName = baseNameOf(path);
-        bool found = false;
-
-        for (int j = 0; j < 2; j++) {
-
-            Path logPath =
-                j == 0
-                ? (format("%1%/%2%/%3%/%4%") % store2->logDir % drvsLogDir % string(baseName, 0, 2) % string(baseName, 2)).str()
-                : (format("%1%/%2%/%3%") % store2->logDir % drvsLogDir % baseName).str();
-            Path logBz2Path = logPath + ".bz2";
-
-            if (pathExists(logPath)) {
-                /* !!! Make this run in O(1) memory. */
-                string log = readFile(logPath);
-                writeFull(STDOUT_FILENO, log);
-                found = true;
-                break;
-            }
-
-            else if (pathExists(logBz2Path)) {
-                std::cout << *decompress("bzip2", readFile(logBz2Path));
-                found = true;
-                break;
-            }
-        }
-
-        if (!found) {
-            for (auto & i : settings.logServers) {
-                string prefix = i;
-                if (!prefix.empty() && prefix.back() != '/') prefix += '/';
-                string url = prefix + baseName;
-                try {
-                    string log = runProgram(CURL, true, {"--fail", "--location", "--silent", "--", url});
-                    std::cout << "(using build log from " << url << ")" << std::endl;
-                    std::cout << log;
-                    found = true;
-                    break;
-                } catch (ExecError & e) {
-                    /* Ignore errors from curl. FIXME: actually, might be
-                       nice to print a warning on HTTP status != 404. */
-                }
-            }
-        }
-
-        if (!found) throw Error(format("build log of derivation ‘%1%’ is not available") % path);
+        auto path = store->followLinksToStorePath(i);
+        auto log = store->getBuildLog(path);
+        if (!log)
+            throw Error("build log of derivation ‘%s’ is not available", path);
+        std::cout << *log;
     }
 }
 
@@ -709,6 +661,9 @@ static void opExport(Strings opFlags, Strings opArgs)
     for (auto & i : opFlags)
         throw UsageError(format("unknown flag ‘%1%’") % i);
 
+    for (auto & i : opArgs)
+        i = store->followLinksToStorePath(i);
+
     FdSink sink(STDOUT_FILENO);
     store->exportPaths(opArgs, sink);
 }
@@ -722,7 +677,7 @@ static void opImport(Strings opFlags, Strings opArgs)
     if (!opArgs.empty()) throw UsageError("no arguments expected");
 
     FdSource source(STDIN_FILENO);
-    Paths paths = store->importPaths(source, 0);
+    Paths paths = store->importPaths(source, nullptr, true);
 
     for (auto & i : paths)
         cout << format("%1%\n") % i << std::flush;
@@ -840,7 +795,13 @@ static void opServe(Strings opFlags, Strings opArgs)
         settings.maxSilentTime = readInt(in);
         settings.buildTimeout = readInt(in);
         if (GET_PROTOCOL_MINOR(clientVersion) >= 2)
-            settings.maxLogSize = readInt(in);
+            in >> settings.maxLogSize;
+        if (GET_PROTOCOL_MINOR(clientVersion) >= 3) {
+            settings.set("build-repeat", std::to_string(readInt(in)));
+            settings.set("enforce-determinism", readInt(in) != 0 ? "true" : "false");
+            settings.set("run-diff-hook", "true");
+        }
+        settings.printRepeatedBuilds = false;
     };
 
     while (true) {
@@ -917,9 +878,7 @@ static void opServe(Strings opFlags, Strings opArgs)
 
             case cmdExportPaths: {
                 readInt(in); // obsolete
-                Paths sorted = store->topoSortPaths(readStorePaths<PathSet>(*store, in));
-                reverse(sorted.begin(), sorted.end());
-                store->exportPaths(sorted, out);
+                store->exportPaths(readStorePaths<Paths>(*store, in), out);
                 break;
             }
 
@@ -956,15 +915,17 @@ static void opServe(Strings opFlags, Strings opArgs)
 
                 out << status.status << status.errorMsg;
 
+                if (GET_PROTOCOL_MINOR(clientVersion) >= 3)
+                    out << status.timesBuilt << status.isNonDeterministic << status.startTime << status.stopTime;
+
                 break;
             }
 
             case cmdQueryClosure: {
                 bool includeOutputs = readInt(in);
-                PathSet paths = readStorePaths<PathSet>(*store, in);
                 PathSet closure;
-                for (auto & i : paths)
-                    store->computeFSClosure(i, closure, false, includeOutputs);
+                store->computeFSClosure(readStorePaths<PathSet>(*store, in),
+                    closure, false, includeOutputs);
                 out << closure;
                 break;
             }

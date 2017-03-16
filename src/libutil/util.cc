@@ -1,15 +1,17 @@
-#include "config.h"
-
 #include "util.hh"
 #include "affinity.hh"
+#include "sync.hh"
+#include "finally.hh"
 
-#include <iostream>
+#include <cctype>
 #include <cerrno>
 #include <cstdio>
 #include <cstdlib>
-#include <sstream>
 #include <cstring>
-#include <cctype>
+#include <iostream>
+#include <sstream>
+#include <thread>
+#include <future>
 
 #include <sys/wait.h>
 #include <unistd.h>
@@ -234,11 +236,11 @@ DirEntries readDirectory(const Path & path)
     DirEntries entries;
     entries.reserve(64);
 
-    AutoCloseDir dir = opendir(path.c_str());
+    AutoCloseDir dir(opendir(path.c_str()));
     if (!dir) throw SysError(format("opening directory ‘%1%’") % path);
 
     struct dirent * dirent;
-    while (errno = 0, dirent = readdir(dir)) { /* sic */
+    while (errno = 0, dirent = readdir(dir.get())) { /* sic */
         checkInterrupt();
         string name = dirent->d_name;
         if (name == "." || name == "..") continue;
@@ -272,11 +274,10 @@ string readFile(int fd)
     if (fstat(fd, &st) == -1)
         throw SysError("statting file");
 
-    unsigned char * buf = new unsigned char[st.st_size];
-    AutoDeleteArray<unsigned char> d(buf);
-    readFull(fd, buf, st.st_size);
+    auto buf = std::make_unique<unsigned char[]>(st.st_size);
+    readFull(fd, buf.get(), st.st_size);
 
-    return string((char *) buf, st.st_size);
+    return string((char *) buf.get(), st.st_size);
 }
 
 
@@ -289,9 +290,9 @@ string readFile(const Path & path, bool drain)
 }
 
 
-void writeFile(const Path & path, const string & s)
+void writeFile(const Path & path, const string & s, mode_t mode)
 {
-    AutoCloseFD fd = open(path.c_str(), O_WRONLY | O_TRUNC | O_CREAT | O_CLOEXEC, 0666);
+    AutoCloseFD fd = open(path.c_str(), O_WRONLY | O_TRUNC | O_CREAT | O_CLOEXEC, mode);
     if (!fd)
         throw SysError(format("opening file ‘%1%’") % path);
     writeFull(fd.get(), s);
@@ -339,10 +340,11 @@ static void _deletePath(const Path & path, unsigned long long & bytesFreed)
         bytesFreed += st.st_blocks * 512;
 
     if (S_ISDIR(st.st_mode)) {
-        /* Make the directory writable. */
-        if (!(st.st_mode & S_IWUSR)) {
-            if (chmod(path.c_str(), st.st_mode | S_IWUSR) == -1)
-                throw SysError(format("making ‘%1%’ writable") % path);
+        /* Make the directory accessible. */
+        const auto PERM_MASK = S_IRUSR | S_IWUSR | S_IXUSR;
+        if ((st.st_mode & PERM_MASK) != PERM_MASK) {
+            if (chmod(path.c_str(), st.st_mode | PERM_MASK) == -1)
+                throw SysError(format("chmod ‘%1%’") % path);
         }
 
         for (auto & i : readDirectory(path))
@@ -645,69 +647,26 @@ void Pipe::create()
 //////////////////////////////////////////////////////////////////////
 
 
-AutoCloseDir::AutoCloseDir()
-{
-    dir = 0;
-}
-
-
-AutoCloseDir::AutoCloseDir(DIR * dir)
-{
-    this->dir = dir;
-}
-
-
-AutoCloseDir::~AutoCloseDir()
-{
-    close();
-}
-
-
-void AutoCloseDir::operator =(DIR * dir)
-{
-    this->dir = dir;
-}
-
-
-AutoCloseDir::operator DIR *()
-{
-    return dir;
-}
-
-
-void AutoCloseDir::close()
-{
-    if (dir) {
-        closedir(dir);
-        dir = 0;
-    }
-}
-
-
-//////////////////////////////////////////////////////////////////////
-
-
 Pid::Pid()
-    : pid(-1), separatePG(false), killSignal(SIGKILL)
 {
 }
 
 
 Pid::Pid(pid_t pid)
-    : pid(pid), separatePG(false), killSignal(SIGKILL)
+    : pid(pid)
 {
 }
 
 
 Pid::~Pid()
 {
-    kill();
+    if (pid != -1) kill();
 }
 
 
 void Pid::operator =(pid_t pid)
 {
-    if (this->pid != pid) kill();
+    if (this->pid != -1 && this->pid != pid) kill();
     this->pid = pid;
     killSignal = SIGKILL; // reset signal to default
 }
@@ -719,12 +678,11 @@ Pid::operator pid_t()
 }
 
 
-void Pid::kill(bool quiet)
+int Pid::kill()
 {
-    if (pid == -1 || pid == 0) return;
+    assert(pid != -1);
 
-    if (!quiet)
-        printError(format("killing process %1%") % pid);
+    debug(format("killing process %1%") % pid);
 
     /* Send the requested signal to the child.  If it has its own
        process group, send the signal to every process in the child
@@ -732,32 +690,20 @@ void Pid::kill(bool quiet)
     if (::kill(separatePG ? -pid : pid, killSignal) != 0)
         printError((SysError(format("killing process %1%") % pid).msg()));
 
-    /* Wait until the child dies, disregarding the exit status. */
-    int status;
-    while (waitpid(pid, &status, 0) == -1) {
-        checkInterrupt();
-        if (errno != EINTR) {
-            printError(
-                (SysError(format("waiting for process %1%") % pid).msg()));
-            break;
-        }
-    }
-
-    pid = -1;
+    return wait();
 }
 
 
-int Pid::wait(bool block)
+int Pid::wait()
 {
     assert(pid != -1);
     while (1) {
         int status;
-        int res = waitpid(pid, &status, block ? 0 : WNOHANG);
+        int res = waitpid(pid, &status, 0);
         if (res == pid) {
             pid = -1;
             return status;
         }
-        if (res == 0 && !block) return -1;
         if (errno != EINTR)
             throw SysError("cannot get child exit status");
         checkInterrupt();
@@ -774,6 +720,14 @@ void Pid::setSeparatePG(bool separatePG)
 void Pid::setKillSignal(int signal)
 {
     this->killSignal = signal;
+}
+
+
+pid_t Pid::release()
+{
+    pid_t p = pid;
+    pid = -1;
+    return p;
 }
 
 
@@ -814,7 +768,7 @@ void killUser(uid_t uid)
         _exit(0);
     }, options);
 
-    int status = pid.wait(true);
+    int status = pid.wait();
     if (status != 0)
         throw Error(format("cannot kill processes for uid ‘%1%’: %2%") % uid % statusToString(status));
 
@@ -884,26 +838,26 @@ std::vector<char *> stringsToCharPtrs(const Strings & ss)
 
 
 string runProgram(Path program, bool searchPath, const Strings & args,
-    const string & input)
+    const std::experimental::optional<std::string> & input)
 {
     checkInterrupt();
 
     /* Create a pipe. */
     Pipe out, in;
     out.create();
-    if (!input.empty()) in.create();
+    if (input) in.create();
 
     /* Fork. */
     Pid pid = startProcess([&]() {
         if (dup2(out.writeSide.get(), STDOUT_FILENO) == -1)
             throw SysError("dupping stdout");
-        if (!input.empty()) {
-            if (dup2(in.readSide.get(), STDIN_FILENO) == -1)
-                throw SysError("dupping stdin");
-        }
+        if (input && dup2(in.readSide.get(), STDIN_FILENO) == -1)
+            throw SysError("dupping stdin");
 
         Strings args_(args);
         args_.push_front(program);
+
+        restoreSignals();
 
         if (searchPath)
             execvp(program.c_str(), stringsToCharPtrs(args_).data());
@@ -915,20 +869,39 @@ string runProgram(Path program, bool searchPath, const Strings & args,
 
     out.writeSide = -1;
 
-    /* FIXME: This can deadlock if the input is too long. */
-    if (!input.empty()) {
+    std::thread writerThread;
+
+    std::promise<void> promise;
+
+    Finally doJoin([&]() {
+        if (writerThread.joinable())
+            writerThread.join();
+    });
+
+
+    if (input) {
         in.readSide = -1;
-        writeFull(in.writeSide.get(), input);
-        in.writeSide = -1;
+        writerThread = std::thread([&]() {
+            try {
+                writeFull(in.writeSide.get(), *input);
+                promise.set_value();
+            } catch (...) {
+                promise.set_exception(std::current_exception());
+            }
+            in.writeSide = -1;
+        });
     }
 
     string result = drainFD(out.readSide.get());
 
     /* Wait for the child to finish. */
-    int status = pid.wait(true);
+    int status = pid.wait();
     if (!statusOk(status))
         throw ExecError(status, format("program ‘%1%’ %2%")
             % program % statusToString(status));
+
+    /* Wait for the writer thread to finish. */
+    if (input) promise.get_future().get();
 
     return result;
 }
@@ -954,20 +927,10 @@ void closeOnExec(int fd)
 }
 
 
-void restoreSIGPIPE()
-{
-    struct sigaction act;
-    act.sa_handler = SIG_DFL;
-    act.sa_flags = 0;
-    sigemptyset(&act.sa_mask);
-    if (sigaction(SIGPIPE, &act, 0)) throw SysError("resetting SIGPIPE");
-}
-
-
 //////////////////////////////////////////////////////////////////////
 
 
-volatile sig_atomic_t _isInterrupted = 0;
+bool _isInterrupted = false;
 
 thread_local bool interruptThrown = false;
 
@@ -1233,5 +1196,81 @@ void callFailure(const std::function<void(std::exception_ptr exc)> & failure, st
     }
 }
 
+
+static Sync<std::list<std::function<void()>>> _interruptCallbacks;
+
+static void signalHandlerThread(sigset_t set)
+{
+    while (true) {
+        int signal = 0;
+        sigwait(&set, &signal);
+
+        if (signal == SIGINT || signal == SIGTERM || signal == SIGHUP)
+            triggerInterrupt();
+    }
+}
+
+void triggerInterrupt()
+{
+    _isInterrupted = 1;
+
+    {
+        auto interruptCallbacks(_interruptCallbacks.lock());
+        for (auto & callback : *interruptCallbacks) {
+            try {
+                callback();
+            } catch (...) {
+                ignoreException();
+            }
+        }
+    }
+}
+
+static sigset_t savedSignalMask;
+
+void startSignalHandlerThread()
+{
+    if (sigprocmask(SIG_BLOCK, nullptr, &savedSignalMask))
+        throw SysError("quering signal mask");
+
+    sigset_t set;
+    sigemptyset(&set);
+    sigaddset(&set, SIGINT);
+    sigaddset(&set, SIGTERM);
+    sigaddset(&set, SIGHUP);
+    sigaddset(&set, SIGPIPE);
+    if (pthread_sigmask(SIG_BLOCK, &set, nullptr))
+        throw SysError("blocking signals");
+
+    std::thread(signalHandlerThread, set).detach();
+}
+
+void restoreSignals()
+{
+    if (sigprocmask(SIG_SETMASK, &savedSignalMask, nullptr))
+        throw SysError("restoring signals");
+}
+
+/* RAII helper to automatically deregister a callback. */
+struct InterruptCallbackImpl : InterruptCallback
+{
+    std::list<std::function<void()>>::iterator it;
+    ~InterruptCallbackImpl() override
+    {
+        _interruptCallbacks.lock()->erase(it);
+    }
+};
+
+std::unique_ptr<InterruptCallback> createInterruptCallback(std::function<void()> callback)
+{
+    auto interruptCallbacks(_interruptCallbacks.lock());
+    interruptCallbacks->push_back(callback);
+
+    auto res = std::make_unique<InterruptCallbackImpl>();
+    res->it = interruptCallbacks->end();
+    res->it--;
+
+    return std::unique_ptr<InterruptCallback>(res.release());
+}
 
 }

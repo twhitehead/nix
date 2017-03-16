@@ -58,12 +58,14 @@ static void prim_fetchgit(EvalState & state, const Pos & pos, Value * * args, Va
 
         for (auto & attr : *args[0]->attrs) {
             string name(attr.name);
-            if (name == "url")
-                url = state.forceStringNoCtx(*attr.value, *attr.pos);
-            else if (name == "rev")
+            if (name == "url") {
+                PathSet context;
+                url = state.coerceToString(*attr.pos, *attr.value, context, false, false);
+                if (hasPrefix(url, "/")) url = "file://" + url;
+            } else if (name == "rev")
                 rev = state.forceStringNoCtx(*attr.value, *attr.pos);
             else
-                throw EvalError(format("unsupported argument ‘%1%’ to ‘fetchgit’, at %3%") % attr.name % attr.pos);
+                throw EvalError("unsupported argument ‘%s’ to ‘fetchgit’, at %s", attr.name, *attr.pos);
         }
 
         if (url.empty())

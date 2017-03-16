@@ -93,8 +93,9 @@
   <term><option>-j</option></term>
 
   <listitem><para>Sets the maximum number of build jobs that Nix will
-  perform in parallel to the specified number.  The default is
-  specified by the <link
+  perform in parallel to the specified number.  Specify
+  <literal>auto</literal> to use the number of CPUs in the system.
+  The default is specified by the <link
   linkend='conf-build-max-jobs'><literal>build-max-jobs</literal></link>
   configuration setting, which itself defaults to
   <literal>1</literal>.  A higher value is useful on SMP systems or to
@@ -191,6 +192,23 @@
 
 </varlistentry>
 
+<varlistentry><term><option>--no-build-hook</option></term>
+
+  <listitem>
+
+  <para>Disables the build hook mechanism.  This allows to ignore remote
+  builders if they are setup on the machine.</para>
+
+  <para>It's useful in cases where the bandwidth between the client and the
+  remote builder is too low.  In that case it can take more time to upload the
+  sources to the remote builder and fetch back the result than to do the
+  computation locally.</para>
+
+  </listitem>
+
+</varlistentry>
+
+
 
 <varlistentry><term><option>--readonly-mode</option></term>
 
@@ -218,9 +236,8 @@
   named <replaceable>name</replaceable>, it will call it with value
   <replaceable>value</replaceable>.</para>
 
-  <para>For instance, the file
-  <literal>pkgs/top-level/all-packages.nix</literal> in Nixpkgs is
-  actually a function:
+  <para>For instance, the top-level <literal>default.nix</literal> in
+  Nixpkgs is actually a function:
 
 <programlisting>
 { # The system (e.g., `i686-linux') for which to build the packages.

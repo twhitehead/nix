@@ -1,4 +1,3 @@
-#include "config.h"
 #include "local-store.hh"
 #include "globals.hh"
 #include "archive.hh"
@@ -37,7 +36,8 @@ namespace nix {
 
 
 LocalStore::LocalStore(const Params & params)
-    : LocalFSStore(params)
+    : Store(params)
+    , LocalFSStore(params)
     , realStoreDir(get(params, "real", rootDir != "" ? rootDir + "/nix/store" : storeDir))
     , dbDir(stateDir + "/db")
     , linksDir(realStoreDir + "/.links")
@@ -124,7 +124,7 @@ LocalStore::LocalStore(const Params & params)
 #endif
             if (res == -1) {
                 writeFull(fd.get(), string(settings.reservedSize, 'X'));
-                ftruncate(fd.get(), settings.reservedSize);
+                [[gnu::unused]] auto res2 = ftruncate(fd.get(), settings.reservedSize);
             }
         }
     } catch (SysError & e) { /* don't care about errors */
@@ -519,6 +519,8 @@ void LocalStore::checkDerivationOutputs(const Path & drvPath, const Derivation &
 uint64_t LocalStore::addValidPath(State & state,
     const ValidPathInfo & info, bool checkOutputs)
 {
+    assert(info.ca == "" || info.isContentAddressed(*this));
+
     state.stmtRegisterValidPath.use()
         (info.path)
         ("sha256:" + printHash(info.narHash))
@@ -667,7 +669,7 @@ bool LocalStore::isValidPathUncached(const Path & path)
 }
 
 
-PathSet LocalStore::queryValidPaths(const PathSet & paths)
+PathSet LocalStore::queryValidPaths(const PathSet & paths, bool maybeSubstitute)
 {
     PathSet res;
     for (auto & i : paths)
@@ -781,18 +783,27 @@ Path LocalStore::queryPathFromHashPart(const string & hashPart)
 PathSet LocalStore::querySubstitutablePaths(const PathSet & paths)
 {
     if (!settings.useSubstitutes) return PathSet();
+
+    auto remaining = paths;
     PathSet res;
+
     for (auto & sub : getDefaultSubstituters()) {
+        if (remaining.empty()) break;
         if (sub->storeDir != storeDir) continue;
         if (!sub->wantMassQuery()) continue;
-        for (auto & path : paths) {
-            if (res.count(path)) continue;
-            debug(format("checking substituter ‘%s’ for path ‘%s’")
-                % sub->getUri() % path);
-            if (sub->isValidPath(path))
+
+        auto valid = sub->queryValidPaths(remaining);
+
+        PathSet remaining2;
+        for (auto & path : remaining)
+            if (valid.count(path))
                 res.insert(path);
-        }
+            else
+                remaining2.insert(path);
+
+        std::swap(remaining, remaining2);
     }
+
     return res;
 }
 
@@ -900,16 +911,16 @@ void LocalStore::invalidatePath(State & state, const Path & path)
 }
 
 
-void LocalStore::addToStore(const ValidPathInfo & info, const std::string & nar,
-    bool repair, bool dontCheckSigs)
+void LocalStore::addToStore(const ValidPathInfo & info, const ref<std::string> & nar,
+    bool repair, bool dontCheckSigs, std::shared_ptr<FSAccessor> accessor)
 {
-    Hash h = hashString(htSHA256, nar);
+    Hash h = hashString(htSHA256, *nar);
     if (h != info.narHash)
         throw Error(format("hash mismatch importing path ‘%s’; expected hash ‘%s’, got ‘%s’") %
             info.path % info.narHash.to_string() % h.to_string());
 
     if (requireSigs && !dontCheckSigs && !info.checkSignatures(*this, publicKeys))
-        throw Error(format("cannot import path ‘%s’ because it lacks a valid signature") % info.path);
+        throw Error("cannot add path ‘%s’ because it lacks a valid signature", info.path);
 
     addTempRoot(info.path);
 
@@ -930,7 +941,7 @@ void LocalStore::addToStore(const ValidPathInfo & info, const std::string & nar,
 
             deletePath(realPath);
 
-            StringSource source(nar);
+            StringSource source(*nar);
             restorePath(realPath, source);
 
             canonicalisePathMetaData(realPath, -1);
@@ -993,7 +1004,7 @@ Path LocalStore::addToStoreFromDump(const string & dump, const string & name,
             info.narHash = hash.first;
             info.narSize = hash.second;
             info.ultimate = true;
-            info.ca = "fixed:" + (recursive ? (std::string) "r:" : "") + h.to_string();
+            info.ca = makeFixedOutputCA(recursive, h);
             registerValidPath(info);
         }
 

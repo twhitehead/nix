@@ -13,6 +13,8 @@
 #include <limits>
 #include <cstdio>
 #include <map>
+#include <sstream>
+#include <experimental/optional>
 
 #ifndef HAVE_STRUCT_DIRENT_D_TYPE
 #define DT_UNKNOWN 0
@@ -89,7 +91,7 @@ string readFile(int fd);
 string readFile(const Path & path, bool drain = false);
 
 /* Write a string to a file. */
-void writeFile(const Path & path, const string & s);
+void writeFile(const Path & path, const string & s, mode_t mode = 0666);
 
 /* Read a line from a file descriptor. */
 string readLine(int fd);
@@ -139,18 +141,6 @@ string drainFD(int fd);
 /* Automatic cleanup of resources. */
 
 
-template <class T>
-struct AutoDeleteArray
-{
-    T * p;
-    AutoDeleteArray(T * p) : p(p) { }
-    ~AutoDeleteArray()
-    {
-        delete [] p;
-    }
-};
-
-
 class AutoDelete
 {
     Path path;
@@ -192,34 +182,33 @@ public:
 };
 
 
-class AutoCloseDir
+struct DIRDeleter
 {
-    DIR * dir;
-public:
-    AutoCloseDir();
-    AutoCloseDir(DIR * dir);
-    ~AutoCloseDir();
-    void operator =(DIR * dir);
-    operator DIR *();
-    void close();
+    void operator()(DIR * dir) const {
+        closedir(dir);
+    }
 };
+
+typedef std::unique_ptr<DIR, DIRDeleter> AutoCloseDir;
 
 
 class Pid
 {
-    pid_t pid;
-    bool separatePG;
-    int killSignal;
+    pid_t pid = -1;
+    bool separatePG = false;
+    int killSignal = SIGKILL;
 public:
     Pid();
     Pid(pid_t pid);
     ~Pid();
     void operator =(pid_t pid);
     operator pid_t();
-    void kill(bool quiet = false);
-    int wait(bool block);
+    int kill();
+    int wait();
+
     void setSeparatePG(bool separatePG);
     void setKillSignal(int signal);
+    pid_t release();
 };
 
 
@@ -232,11 +221,10 @@ void killUser(uid_t uid);
    pid to the caller. */
 struct ProcessOptions
 {
-    string errorPrefix;
-    bool dieWithParent;
-    bool runExitHandlers;
-    bool allowVfork;
-    ProcessOptions() : errorPrefix("error: "), dieWithParent(true), runExitHandlers(false), allowVfork(true) { };
+    string errorPrefix = "error: ";
+    bool dieWithParent = true;
+    bool runExitHandlers = false;
+    bool allowVfork = true;
 };
 
 pid_t startProcess(std::function<void()> fun, const ProcessOptions & options = ProcessOptions());
@@ -245,7 +233,8 @@ pid_t startProcess(std::function<void()> fun, const ProcessOptions & options = P
 /* Run a program and return its stdout in a string (i.e., like the
    shell backtick operator). */
 string runProgram(Path program, bool searchPath = false,
-    const Strings & args = Strings(), const string & input = "");
+    const Strings & args = Strings(),
+    const std::experimental::optional<std::string> & input = {});
 
 class ExecError : public Error
 {
@@ -270,14 +259,10 @@ void closeMostFDs(const set<int> & exceptions);
 /* Set the close-on-exec flag for the given file descriptor. */
 void closeOnExec(int fd);
 
-/* Restore default handling of SIGPIPE, otherwise some programs will
-   randomly say "Broken pipe". */
-void restoreSIGPIPE();
-
 
 /* User interruption. */
 
-extern volatile sig_atomic_t _isInterrupted;
+extern bool _isInterrupted;
 
 extern thread_local bool interruptThrown;
 
@@ -289,6 +274,9 @@ void inline checkInterrupt()
 }
 
 MakeError(Interrupted, BaseError)
+
+
+MakeError(FormatError, Error)
 
 
 /* String tokenizer. */
@@ -428,6 +416,40 @@ void callSuccess(
         callFailure(failure);
     }
 }
+
+
+/* Start a thread that handles various signals. Also block those signals
+   on the current thread (and thus any threads created by it). */
+void startSignalHandlerThread();
+
+/* Restore default signal handling. */
+void restoreSignals();
+
+struct InterruptCallback
+{
+    virtual ~InterruptCallback() { };
+};
+
+/* Register a function that gets called on SIGINT (in a non-signal
+   context). */
+std::unique_ptr<InterruptCallback> createInterruptCallback(
+    std::function<void()> callback);
+
+void triggerInterrupt();
+
+/* A RAII class that causes the current thread to receive SIGUSR1 when
+   the signal handler thread receives SIGINT. That is, this allows
+   SIGINT to be multiplexed to multiple threads. */
+struct ReceiveInterrupts
+{
+    pthread_t target;
+    std::unique_ptr<InterruptCallback> callback;
+
+    ReceiveInterrupts()
+        : target(pthread_self())
+        , callback(createInterruptCallback([&]() { pthread_kill(target, SIGUSR1); }))
+    { }
+};
 
 
 }

@@ -1,10 +1,9 @@
-#include "config.h"
-
 #include "util.hh"
 #include "local-store.hh"
 #include "globals.hh"
 
 #include <cstdlib>
+#include <cstring>
 #include <sys/types.h>
 #include <sys/stat.h>
 #include <unistd.h>
@@ -46,11 +45,11 @@ LocalStore::InodeHash LocalStore::loadInodeHash()
     debug("loading hash inodes in memory");
     InodeHash inodeHash;
 
-    AutoCloseDir dir = opendir(linksDir.c_str());
+    AutoCloseDir dir(opendir(linksDir.c_str()));
     if (!dir) throw SysError(format("opening directory ‘%1%’") % linksDir);
 
     struct dirent * dirent;
-    while (errno = 0, dirent = readdir(dir)) { /* sic */
+    while (errno = 0, dirent = readdir(dir.get())) { /* sic */
         checkInterrupt();
         // We don't care if we hit non-hash files, anything goes
         inodeHash.insert(dirent->d_ino);
@@ -67,11 +66,11 @@ Strings LocalStore::readDirectoryIgnoringInodes(const Path & path, const InodeHa
 {
     Strings names;
 
-    AutoCloseDir dir = opendir(path.c_str());
+    AutoCloseDir dir(opendir(path.c_str()));
     if (!dir) throw SysError(format("opening directory ‘%1%’") % path);
 
     struct dirent * dirent;
-    while (errno = 0, dirent = readdir(dir)) { /* sic */
+    while (errno = 0, dirent = readdir(dir.get())) { /* sic */
         checkInterrupt();
 
         if (inodeHash.count(dirent->d_ino)) {
@@ -148,10 +147,24 @@ void LocalStore::optimisePath_(OptimiseStats & stats, const Path & path, InodeHa
             inodeHash.insert(st.st_ino);
             return;
         }
-        if (errno != EEXIST)
-            throw SysError(format("cannot link ‘%1%’ to ‘%2%’") % linkPath % path);
-        /* Fall through if another process created ‘linkPath’ before
-           we did. */
+
+        switch (errno) {
+        case EEXIST:
+            /* Fall through if another process created ‘linkPath’ before
+               we did. */
+            break;
+
+        case ENOSPC:
+            /* On ext4, that probably means the directory index is
+               full.  When that happens, it's fine to ignore it: we
+               just effectively disable deduplication of this
+               file.  */
+            printInfo("cannot link ‘%s’ to ‘%s’: %s", linkPath, path, strerror(errno));
+            return;
+
+        default:
+            throw SysError("cannot link ‘%1%’ to ‘%2%’", linkPath, path);
+        }
     }
 
     /* Yes!  We've seen a file with the same contents.  Replace the
@@ -195,7 +208,7 @@ void LocalStore::optimisePath_(OptimiseStats & stats, const Path & path, InodeHa
                 printInfo(format("‘%1%’ has maximum number of links") % linkPath);
             return;
         }
-        throw SysError(format("cannot link ‘%1%’ to ‘%2%’") % tempLink % linkPath);
+        throw SysError("cannot link ‘%1%’ to ‘%2%’", tempLink, linkPath);
     }
 
     /* Atomically replace the old file with the new hard link. */

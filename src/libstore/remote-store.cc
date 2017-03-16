@@ -37,26 +37,48 @@ template<class T> T readStorePaths(Store & store, Source & from)
 }
 
 template PathSet readStorePaths(Store & store, Source & from);
+template Paths readStorePaths(Store & store, Source & from);
 
-
-RemoteStore::RemoteStore(const Params & params, size_t maxConnections)
-    : LocalFSStore(params)
+/* TODO: Separate these store impls into different files, give them better names */
+RemoteStore::RemoteStore(const Params & params)
+    : Store(params)
     , connections(make_ref<Pool<Connection>>(
-            maxConnections,
-            [this]() { return openConnection(); },
+            std::max(1, std::stoi(get(params, "max-connections", "1"))),
+            [this]() { return openConnectionWrapper(); },
             [](const ref<Connection> & r) { return r->to.good() && r->from.good(); }
             ))
 {
 }
 
 
-std::string RemoteStore::getUri()
+ref<RemoteStore::Connection> RemoteStore::openConnectionWrapper()
+{
+    if (failed)
+        throw Error("opening a connection to remote store ‘%s’ previously failed", getUri());
+    try {
+        return openConnection();
+    } catch (...) {
+        failed = true;
+        throw;
+    }
+}
+
+
+UDSRemoteStore::UDSRemoteStore(const Params & params)
+    : Store(params)
+    , LocalFSStore(params)
+    , RemoteStore(params)
+{
+}
+
+
+std::string UDSRemoteStore::getUri()
 {
     return "daemon";
 }
 
 
-ref<RemoteStore::Connection> RemoteStore::openConnection()
+ref<RemoteStore::Connection> UDSRemoteStore::openConnection()
 {
     auto conn = make_ref<Connection>();
 
@@ -68,44 +90,50 @@ ref<RemoteStore::Connection> RemoteStore::openConnection()
     else
         conn = connectToDaemonINET(remoteMode);
 
-    /* Send the magic greeting, check for the reply. */
-    try {
-        conn->to << WORKER_MAGIC_1;
-        conn->to.flush();
-        unsigned int magic = readInt(conn->from);
-        if (magic != WORKER_MAGIC_2) throw Error("protocol mismatch");
-
-        conn->daemonVersion = readInt(conn->from);
-        if (GET_PROTOCOL_MAJOR(conn->daemonVersion) != GET_PROTOCOL_MAJOR(PROTOCOL_VERSION))
-            throw Error("Nix daemon protocol version not supported");
-        if (GET_PROTOCOL_MINOR(conn->daemonVersion) < 10)
-            throw Error("the Nix daemon version is too old");
-        conn->to << PROTOCOL_VERSION;
-
-        if (GET_PROTOCOL_MINOR(conn->daemonVersion) >= 14) {
-            int cpu = settings.lockCPU ? lockToCurrentCPU() : -1;
-            if (cpu != -1)
-                conn->to << 1 << cpu;
-            else
-                conn->to << 0;
-        }
-
-        if (GET_PROTOCOL_MINOR(conn->daemonVersion) >= 11)
-            conn->to << false;
-
-        conn->processStderr();
-    }
-    catch (Error & e) {
-        throw Error(format("cannot start daemon worker: %1%") % e.msg());
-    }
-
-    setOptions(conn);
+    initConnection(*conn);
 
     return conn;
 }
 
 
-ref<RemoteStore::Connection> RemoteStore::connectToDaemonUNIX()
+void RemoteStore::initConnection(Connection & conn)
+{
+    /* Send the magic greeting, check for the reply. */
+    try {
+        conn.to << WORKER_MAGIC_1;
+        conn.to.flush();
+        unsigned int magic = readInt(conn.from);
+        if (magic != WORKER_MAGIC_2) throw Error("protocol mismatch");
+
+        conn.from >> conn.daemonVersion;
+        if (GET_PROTOCOL_MAJOR(conn.daemonVersion) != GET_PROTOCOL_MAJOR(PROTOCOL_VERSION))
+            throw Error("Nix daemon protocol version not supported");
+        if (GET_PROTOCOL_MINOR(conn.daemonVersion) < 10)
+            throw Error("the Nix daemon version is too old");
+        conn.to << PROTOCOL_VERSION;
+
+        if (GET_PROTOCOL_MINOR(conn.daemonVersion) >= 14) {
+            int cpu = settings.lockCPU ? lockToCurrentCPU() : -1;
+            if (cpu != -1)
+                conn.to << 1 << cpu;
+            else
+                conn.to << 0;
+        }
+
+        if (GET_PROTOCOL_MINOR(conn.daemonVersion) >= 11)
+            conn.to << false;
+
+        conn.processStderr();
+    }
+    catch (Error & e) {
+        throw Error("cannot open connection to remote store ‘%s’: %s", getUri(), e.what());
+    }
+
+    setOptions(conn);
+}
+
+
+ref<UDSRemoteStore::Connection> UDSRemoteStore::connectToDaemonUNIX()
 {
     auto conn = make_ref<Connection>();
 
@@ -137,7 +165,7 @@ ref<RemoteStore::Connection> RemoteStore::connectToDaemonUNIX()
 }
 
 
-ref<RemoteStore::Connection> RemoteStore::connectToDaemonINET(const string & remoteAddress)
+ref<UDSRemoteStore::Connection> UDSRemoteStore::connectToDaemonINET(const string & remoteAddress)
 {
     auto conn = make_ref<Connection>();
 
@@ -188,9 +216,9 @@ ref<RemoteStore::Connection> RemoteStore::connectToDaemonINET(const string & rem
 }
 
 
-void RemoteStore::setOptions(ref<Connection> conn)
+void RemoteStore::setOptions(Connection & conn)
 {
-    conn->to << wopSetOptions
+    conn.to << wopSetOptions
        << settings.keepFailed
        << settings.keepGoing
        << settings.tryFallback
@@ -204,16 +232,16 @@ void RemoteStore::setOptions(ref<Connection> conn)
        << settings.buildCores
        << settings.useSubstitutes;
 
-    if (GET_PROTOCOL_MINOR(conn->daemonVersion) >= 12) {
+    if (GET_PROTOCOL_MINOR(conn.daemonVersion) >= 12) {
         Settings::SettingsMap overrides = settings.getOverrides();
         if (overrides["ssh-auth-sock"] == "")
             overrides["ssh-auth-sock"] = getEnv("SSH_AUTH_SOCK");
-        conn->to << overrides.size();
+        conn.to << overrides.size();
         for (auto & i : overrides)
-            conn->to << i.first << i.second;
+            conn.to << i.first << i.second;
     }
 
-    conn->processStderr();
+    conn.processStderr();
 }
 
 
@@ -222,12 +250,11 @@ bool RemoteStore::isValidPathUncached(const Path & path)
     auto conn(connections->get());
     conn->to << wopIsValidPath << path;
     conn->processStderr();
-    unsigned int reply = readInt(conn->from);
-    return reply != 0;
+    return readInt(conn->from);
 }
 
 
-PathSet RemoteStore::queryValidPaths(const PathSet & paths)
+PathSet RemoteStore::queryValidPaths(const PathSet & paths, bool maybeSubstitute)
 {
     auto conn(connections->get());
     if (GET_PROTOCOL_MINOR(conn->daemonVersion) < 12) {
@@ -298,8 +325,8 @@ void RemoteStore::querySubstitutablePathInfos(const PathSet & paths,
 
         conn->to << wopQuerySubstitutablePathInfos << paths;
         conn->processStderr();
-        unsigned int count = readInt(conn->from);
-        for (unsigned int n = 0; n < count; n++) {
+        size_t count = readNum<size_t>(conn->from);
+        for (size_t n = 0; n < count; n++) {
             Path path = readStorePath(*this, conn->from);
             SubstitutablePathInfo & info(infos[path]);
             info.deriver = readString(conn->from);
@@ -329,7 +356,7 @@ void RemoteStore::queryPathInfoUncached(const Path & path,
             throw;
         }
         if (GET_PROTOCOL_MINOR(conn->daemonVersion) >= 17) {
-            bool valid = readInt(conn->from) != 0;
+            bool valid; conn->from >> valid;
             if (!valid) throw InvalidPath(format("path ‘%s’ is not valid") % path);
         }
         auto info = std::make_shared<ValidPathInfo>();
@@ -338,12 +365,11 @@ void RemoteStore::queryPathInfoUncached(const Path & path,
         if (info->deriver != "") assertStorePath(info->deriver);
         info->narHash = parseHash(htSHA256, readString(conn->from));
         info->references = readStorePaths<PathSet>(*this, conn->from);
-        info->registrationTime = readInt(conn->from);
-        info->narSize = readLongLong(conn->from);
+        conn->from >> info->registrationTime >> info->narSize;
         if (GET_PROTOCOL_MINOR(conn->daemonVersion) >= 16) {
-            info->ultimate = readInt(conn->from) != 0;
+            conn->from >> info->ultimate;
             info->sigs = readStrings<StringSet>(conn->from);
-            info->ca = readString(conn->from);
+            conn->from >> info->ca;
         }
         return info;
     });
@@ -399,10 +425,44 @@ Path RemoteStore::queryPathFromHashPart(const string & hashPart)
 }
 
 
-void RemoteStore::addToStore(const ValidPathInfo & info, const std::string & nar,
-    bool repair, bool dontCheckSigs)
+void RemoteStore::addToStore(const ValidPathInfo & info, const ref<std::string> & nar,
+    bool repair, bool dontCheckSigs, std::shared_ptr<FSAccessor> accessor)
 {
-    throw Error("RemoteStore::addToStore() not implemented");
+    auto conn(connections->get());
+
+    if (GET_PROTOCOL_MINOR(conn->daemonVersion) < 18) {
+        conn->to << wopImportPaths;
+
+        StringSink sink;
+        sink << 1 // == path follows
+            ;
+        assert(nar->size() % 8 == 0);
+        sink((unsigned char *) nar->data(), nar->size());
+        sink
+            << exportMagic
+            << info.path
+            << info.references
+            << info.deriver
+            << 0 // == no legacy signature
+            << 0 // == no path follows
+            ;
+
+        StringSource source(*sink.s);
+        conn->processStderr(0, &source);
+
+        auto importedPaths = readStorePaths<PathSet>(*this, conn->from);
+        assert(importedPaths.size() <= 1);
+    }
+
+    else {
+        conn->to << wopAddToStoreNar
+                 << info.path << info.deriver << printHash(info.narHash)
+                 << info.references << info.registrationTime << info.narSize
+                 << info.ultimate << info.sigs << info.ca
+                 << repair << dontCheckSigs;
+        conn->to(*nar);
+        conn->processStderr();
+    }
 }
 
 
@@ -534,7 +594,7 @@ Roots RemoteStore::findRoots()
     auto conn(connections->get());
     conn->to << wopFindRoots;
     conn->processStderr();
-    unsigned int count = readInt(conn->from);
+    size_t count = readNum<size_t>(conn->from);
     Roots result;
     while (count--) {
         Path link = readString(conn->from);
@@ -582,7 +642,7 @@ bool RemoteStore::verifyStore(bool checkContents, bool repair)
     auto conn(connections->get());
     conn->to << wopVerifyStore << checkContents << repair;
     conn->processStderr();
-    return readInt(conn->from) != 0;
+    return readInt(conn->from);
 }
 
 
@@ -599,7 +659,6 @@ RemoteStore::Connection::~Connection()
 {
     try {
         to.flush();
-        fd = -1;
     } catch (...) {
         ignoreException();
     }
@@ -619,10 +678,9 @@ void RemoteStore::Connection::processStderr(Sink * sink, Source * source)
         }
         else if (msg == STDERR_READ) {
             if (!source) throw Error("no source");
-            size_t len = readInt(from);
-            unsigned char * buf = new unsigned char[len];
-            AutoDeleteArray<unsigned char> d(buf);
-            writeString(buf, source->read(buf, len), to);
+            size_t len = readNum<size_t>(from);
+            auto buf = std::make_unique<unsigned char[]>(len);
+            writeString(buf.get(), source->read(buf.get(), len), to);
             to.flush();
         }
         else

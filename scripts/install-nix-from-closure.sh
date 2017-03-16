@@ -7,7 +7,14 @@ self="$(dirname "$0")"
 nix="@nix@"
 cacert="@cacert@"
 
-if ! [ -e $self/.reginfo ]; then
+
+# macOS support for 10.10 or higher
+if [[ "$(uname -s)" = "Darwin" && $(($(sw_vers -productVersion | cut -d '.' -f 2))) -lt 10 ]]; then
+    echo "$0: macOS $(sw_vers -productVersion) is not supported, upgrade to 10.10 or higher"
+    exit 1
+fi
+
+if ! [ -e "$self/.reginfo" ]; then
     echo "$0: incomplete installer (.reginfo is missing)" >&2
     exit 1
 fi
@@ -39,10 +46,10 @@ fi
 
 mkdir -p $dest/store
 
-echo -n "copying Nix to $dest/store..." >&2
+printf "copying Nix to %s..." "${dest}/store" >&2
 
-for i in $(cd $self/store >/dev/null && echo *); do
-    echo -n "." >&2
+for i in $(cd "$self/store" >/dev/null && echo ./*); do
+    printf "." >&2
     i_tmp="$dest/store/$i.$$"
     if [ -e "$i_tmp" ]; then
         rm -rf "$i_tmp"
@@ -63,22 +70,22 @@ if ! $nix/bin/nix-store --init; then
     exit 1
 fi
 
-if ! $nix/bin/nix-store --load-db < $self/.reginfo; then
+if ! "$nix/bin/nix-store" --load-db < "$self/.reginfo"; then
     echo "$0: unable to register valid paths" >&2
     exit 1
 fi
 
-. $nix/etc/profile.d/nix.sh
+. "$nix/etc/profile.d/nix.sh"
 
-if ! $nix/bin/nix-env -i "$nix"; then
+if ! "$nix/bin/nix-env" -i "$nix"; then
     echo "$0: unable to install Nix into your default profile" >&2
     exit 1
 fi
 
 # Install an SSL certificate bundle.
-if [ -z "$SSL_CERT_FILE" -o ! -f "$SSL_CERT_FILE" ]; then
+if [ -z "$NIX_SSL_CERT_FILE" ] || ! [ -f "$NIX_SSL_CERT_FILE" ]; then
     $nix/bin/nix-env -i "$cacert"
-    export SSL_CERT_FILE="$HOME/.nix-profile/etc/ssl/certs/ca-bundle.crt"
+    export NIX_SSL_CERT_FILE="$HOME/.nix-profile/etc/ssl/certs/ca-bundle.crt"
 fi
 
 # Subscribe the user to the Nixpkgs channel and fetch it.
@@ -89,21 +96,25 @@ if [ -z "$_NIX_INSTALLER_TEST" ]; then
     $nix/bin/nix-channel --update nixpkgs
 fi
 
-# Make the shell source nix.sh during login.
-p=$HOME/.nix-profile/etc/profile.d/nix.sh
-
 added=
-for i in .bash_profile .bash_login .profile; do
-    fn="$HOME/$i"
-    if [ -w "$fn" ]; then
-        if ! grep -q "$p" "$fn"; then
-            echo "modifying $fn..." >&2
-            echo "if [ -e $p ]; then . $p; fi # added by Nix installer" >> $fn
+if [ -z "$NIX_INSTALLER_NO_MODIFY_PROFILE" ]; then
+
+    # Make the shell source nix.sh during login.
+    p=$HOME/.nix-profile/etc/profile.d/nix.sh
+
+    for i in .bash_profile .bash_login .profile; do
+        fn="$HOME/$i"
+        if [ -w "$fn" ]; then
+            if ! grep -q "$p" "$fn"; then
+                echo "modifying $fn..." >&2
+                echo "if [ -e $p ]; then . $p; fi # added by Nix installer" >> "$fn"
+            fi
+            added=1
+            break
         fi
-        added=1
-        break
-    fi
-done
+    done
+
+fi
 
 if [ -z "$added" ]; then
     cat >&2 <<EOF

@@ -16,8 +16,6 @@ struct Settings {
 
     Settings();
 
-    void processEnvironment();
-
     void loadConfFile();
 
     void set(const string & name, const string & value);
@@ -149,6 +147,11 @@ struct Settings {
        before being killed (0 means no limit). */
     unsigned long maxLogSize;
 
+    /* When build-repeat > 0 and verboseBuild == true, whether to
+       print repeated builds (i.e. builds other than the first one) to
+       stderr. Hack to prevent Hydra logs from being polluted. */
+    bool printRepeatedBuilds = true;
+
     /* How often (in seconds) to poll for locks. */
     unsigned int pollInterval;
 
@@ -178,15 +181,22 @@ struct Settings {
     /* Whether to show a stack trace if Nix evaluation fails. */
     bool showTrace;
 
-    /* A list of URL prefixes that can return Nix build logs. */
-    Strings logServers;
-
     /* Whether the importNative primop should be enabled */
     bool enableImportNative;
 
     /* The hook to run just before a build to set derivation-specific
        build settings */
     Path preBuildHook;
+
+    /* Path to the netrc file used to obtain usernames/passwords for
+       downloads. */
+    Path netrcFile;
+
+    /* Path to the SSL CA file used */
+    Path caFile;
+
+    /* Whether we allow import-from-derivation */
+    bool enableImportFromDerivation;
 
 private:
     SettingsMap settings, overrides;

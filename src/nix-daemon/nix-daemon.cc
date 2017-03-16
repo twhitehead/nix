@@ -22,6 +22,8 @@
 #include <errno.h>
 #include <pwd.h>
 #include <grp.h>
+#include <fcntl.h>
+#include <limits.h>
 
 #if __APPLE__ || __FreeBSD__
 #include <sys/ucred.h>
@@ -29,6 +31,25 @@
 
 using namespace nix;
 
+#ifndef __linux__
+#define SPLICE_F_MOVE 0
+static ssize_t splice(int fd_in, void *off_in, int fd_out, void *off_out, size_t len, unsigned int flags)
+{
+    /* We ignore most parameters, we just have them for conformance with the linux syscall */
+    char buf[8192];
+    auto read_count = read(fd_in, buf, sizeof(buf));
+    if (read_count == -1)
+        return read_count;
+    auto write_count = decltype(read_count)(0);
+    while (write_count < read_count) {
+        auto res = write(fd_out, buf + write_count, read_count - write_count);
+        if (res == -1)
+            return res;
+        write_count += res;
+    }
+    return read_count;
+}
+#endif
 
 static FdSource from(STDIN_FILENO);
 static FdSink to(STDOUT_FILENO);
@@ -148,21 +169,6 @@ struct RetrieveRegularNARSink : ParseSink
 };
 
 
-/* Adapter class of a Source that saves all data read to `s'. */
-struct SavingSourceAdapter : Source
-{
-    Source & orig;
-    string s;
-    SavingSourceAdapter(Source & orig) : orig(orig) { }
-    size_t read(unsigned char * data, size_t len)
-    {
-        size_t n = orig.read(data, len);
-        s.append((const char *) data, n);
-        return n;
-    }
-};
-
-
 static void performOp(ref<LocalStore> store, bool trusted, unsigned int clientVersion,
     Source & from, Sink & to, unsigned int op)
 {
@@ -267,10 +273,9 @@ static void performOp(ref<LocalStore> store, bool trusted, unsigned int clientVe
     }
 
     case wopAddToStore: {
-        string baseName = readString(from);
-        bool fixed = readInt(from) == 1; /* obsolete */
-        bool recursive = readInt(from) == 1;
-        string s = readString(from);
+        bool fixed, recursive;
+        std::string s, baseName;
+        from >> baseName >> fixed /* obsolete */ >> recursive >> s;
         /* Compatibility hack. */
         if (!fixed) {
             s = "sha256";
@@ -278,7 +283,7 @@ static void performOp(ref<LocalStore> store, bool trusted, unsigned int clientVe
         }
         HashType hashAlgo = parseHashType(s);
 
-        SavingSourceAdapter savedNAR(from);
+        TeeSource savedNAR(from);
         RetrieveRegularNARSink savedRegular;
 
         if (recursive) {
@@ -292,7 +297,7 @@ static void performOp(ref<LocalStore> store, bool trusted, unsigned int clientVe
 
         startWork();
         if (!savedRegular.regular) throw Error("regular file expected");
-        Path path = store->addToStoreFromDump(recursive ? savedNAR.s : savedRegular.s, baseName, recursive, hashAlgo);
+        Path path = store->addToStoreFromDump(recursive ? *savedNAR.data : savedRegular.s, baseName, recursive, hashAlgo);
         stopWork();
 
         to << path;
@@ -304,7 +309,7 @@ static void performOp(ref<LocalStore> store, bool trusted, unsigned int clientVe
         string s = readString(from);
         PathSet refs = readStorePaths<PathSet>(*store, from);
         startWork();
-        Path path = store->addTextToStore(suffix, s, refs);
+        Path path = store->addTextToStore(suffix, s, refs, false);
         stopWork();
         to << path;
         break;
@@ -324,7 +329,7 @@ static void performOp(ref<LocalStore> store, bool trusted, unsigned int clientVe
     case wopImportPaths: {
         startWork();
         TunnelSource source(from);
-        Paths paths = store->importPaths(source, 0);
+        Paths paths = store->importPaths(source, 0, trusted);
         stopWork();
         to << paths;
         break;
@@ -334,7 +339,7 @@ static void performOp(ref<LocalStore> store, bool trusted, unsigned int clientVe
         PathSet drvs = readStorePaths<PathSet>(*store, from);
         BuildMode mode = bmNormal;
         if (GET_PROTOCOL_MINOR(clientVersion) >= 15) {
-            mode = (BuildMode)readInt(from);
+            mode = (BuildMode) readInt(from);
 
             /* Repairing is not atomic, so disallowed for "untrusted"
                clients.  */
@@ -411,8 +416,7 @@ static void performOp(ref<LocalStore> store, bool trusted, unsigned int clientVe
         GCOptions options;
         options.action = (GCOptions::GCAction) readInt(from);
         options.pathsToDelete = readStorePaths<PathSet>(*store, from);
-        options.ignoreLiveness = readInt(from);
-        options.maxFreed = readLongLong(from);
+        from >> options.ignoreLiveness >> options.maxFreed;
         // obsolete fields
         readInt(from);
         readInt(from);
@@ -432,8 +436,8 @@ static void performOp(ref<LocalStore> store, bool trusted, unsigned int clientVe
     }
 
     case wopSetOptions: {
-        settings.keepFailed = readInt(from) != 0;
-        settings.keepGoing = readInt(from) != 0;
+        from >> settings.keepFailed;
+        from >> settings.keepGoing;
         settings.set("build-fallback", readInt(from) ? "true" : "false");
         verbosity = (Verbosity) readInt(from);
         settings.set("build-max-jobs", std::to_string(readInt(from)));
@@ -533,8 +537,8 @@ static void performOp(ref<LocalStore> store, bool trusted, unsigned int clientVe
         break;
 
     case wopVerifyStore: {
-        bool checkContents = readInt(from) != 0;
-        bool repair = readInt(from) != 0;
+        bool checkContents, repair;
+        from >> checkContents >> repair;
         startWork();
         if (repair && !trusted)
             throw Error("you are not privileged to repair paths");
@@ -553,6 +557,38 @@ static void performOp(ref<LocalStore> store, bool trusted, unsigned int clientVe
         store->addSignatures(path, sigs);
         stopWork();
         to << 1;
+        break;
+    }
+
+    case wopNarFromPath: {
+        auto path = readStorePath(*store, from);
+        startWork();
+        stopWork();
+        dumpPath(path, to);
+        break;
+    }
+
+    case wopAddToStoreNar: {
+        bool repair, dontCheckSigs;
+        ValidPathInfo info;
+        info.path = readStorePath(*store, from);
+        from >> info.deriver;
+        if (!info.deriver.empty())
+            store->assertStorePath(info.deriver);
+        info.narHash = parseHash(htSHA256, readString(from));
+        info.references = readStorePaths<PathSet>(*store, from);
+        from >> info.registrationTime >> info.narSize >> info.ultimate;
+        info.sigs = readStrings<StringSet>(from);
+        from >> info.ca >> repair >> dontCheckSigs;
+        if (!trusted && dontCheckSigs)
+            dontCheckSigs = false;
+
+        TeeSink tee(from);
+        parseDump(tee, tee.source);
+
+        startWork();
+        store->addToStore(info, tee.source.data, repair, dontCheckSigs, nullptr);
+        stopWork();
         break;
     }
 
@@ -885,6 +921,8 @@ int main(int argc, char * * argv)
     return handleExceptions(argv[0], [&]() {
         initNix();
 
+        auto stdio = false;
+
         parseCmdLine(argc, argv, [&](Strings::iterator & arg, const Strings::iterator & end) {
             if (*arg == "--daemon")
                 ; /* ignored for backwards compatibility */
@@ -892,10 +930,62 @@ int main(int argc, char * * argv)
                 showManPage("nix-daemon");
             else if (*arg == "--version")
                 printVersion("nix-daemon");
+            else if (*arg == "--stdio")
+                stdio = true;
             else return false;
             return true;
         });
 
-        daemonLoop(argv);
+        if (stdio) {
+            if (getStoreType() == tDaemon) {
+                /* Forward on this connection to the real daemon */
+                auto socketPath = settings.nixDaemonSocketFile;
+                auto s = socket(PF_UNIX, SOCK_STREAM, 0);
+                if (s == -1)
+                    throw SysError("creating Unix domain socket");
+
+                auto socketDir = dirOf(socketPath);
+                if (chdir(socketDir.c_str()) == -1)
+                    throw SysError(format("changing to socket directory ‘%1%’") % socketDir);
+
+                auto socketName = baseNameOf(socketPath);
+                auto addr = sockaddr_un{};
+                addr.sun_family = AF_UNIX;
+                if (socketName.size() + 1 >= sizeof(addr.sun_path))
+                    throw Error(format("socket name %1% is too long") % socketName);
+                strcpy(addr.sun_path, socketName.c_str());
+
+                if (connect(s, (struct sockaddr *) &addr, sizeof(addr)) == -1)
+                    throw SysError(format("cannot connect to daemon at %1%") % socketPath);
+
+                auto nfds = (s > STDIN_FILENO ? s : STDIN_FILENO) + 1;
+                while (true) {
+                    fd_set fds;
+                    FD_ZERO(&fds);
+                    FD_SET(s, &fds);
+                    FD_SET(STDIN_FILENO, &fds);
+                    if (select(nfds, &fds, nullptr, nullptr, nullptr) == -1)
+                        throw SysError("waiting for data from client or server");
+                    if (FD_ISSET(s, &fds)) {
+                        auto res = splice(s, nullptr, STDOUT_FILENO, nullptr, SSIZE_MAX, SPLICE_F_MOVE);
+                        if (res == -1)
+                            throw SysError("splicing data from daemon socket to stdout");
+                        else if (res == 0)
+                            throw EndOfFile("unexpected EOF from daemon socket");
+                    }
+                    if (FD_ISSET(STDIN_FILENO, &fds)) {
+                        auto res = splice(STDIN_FILENO, nullptr, s, nullptr, SSIZE_MAX, SPLICE_F_MOVE);
+                        if (res == -1)
+                            throw SysError("splicing data from stdin to daemon socket");
+                        else if (res == 0)
+                            return;
+                    }
+                }
+            } else {
+                processConnection(true);
+            }
+        } else {
+            daemonLoop(argv);
+        }
     });
 }

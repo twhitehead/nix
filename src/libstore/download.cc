@@ -4,17 +4,23 @@
 #include "hash.hh"
 #include "store-api.hh"
 #include "archive.hh"
+#include "s3.hh"
+#include "compression.hh"
+
+#ifdef ENABLE_S3
+#include <aws/core/client/ClientConfiguration.h>
+#endif
 
 #include <unistd.h>
 #include <fcntl.h>
 
 #include <curl/curl.h>
 
+#include <queue>
 #include <iostream>
 #include <thread>
 #include <cmath>
 #include <random>
-
 
 namespace nix {
 
@@ -31,6 +37,16 @@ std::string resolveUri(const std::string & uri)
         return "https://nixos.org/channels/" + std::string(uri, 8) + "/nixexprs.tar.xz";
     else
         return uri;
+}
+
+ref<std::string> decodeContent(const std::string & encoding, ref<std::string> data)
+{
+    if (encoding == "")
+        return data;
+    else if (encoding == "br")
+        return decompress(encoding, *data);
+    else
+        throw Error("unsupported Content-Encoding ‘%s’", encoding);
 }
 
 struct CurlDownloader : public Downloader
@@ -65,6 +81,8 @@ struct CurlDownloader : public Downloader
         std::chrono::steady_clock::time_point embargo;
 
         struct curl_slist * requestHeaders = 0;
+
+        std::string encoding;
 
         DownloadItem(CurlDownloader & downloader, const DownloadRequest & request)
             : downloader(downloader), request(request)
@@ -123,6 +141,7 @@ struct CurlDownloader : public Downloader
                 auto ss = tokenizeString<vector<string>>(line, " ");
                 status = ss.size() >= 2 ? ss[1] : "";
                 result.data = std::make_shared<std::string>();
+                encoding = "";
             } else {
                 auto i = line.find(':');
                 if (i != string::npos) {
@@ -138,7 +157,8 @@ struct CurlDownloader : public Downloader
                             debug(format("shutting down on 200 HTTP response with expected ETag"));
                             return 0;
                         }
-                    }
+                    } else if (name == "content-encoding")
+                        encoding = trim(string(line, i + 1));;
                 }
             }
             return realSize;
@@ -172,6 +192,13 @@ struct CurlDownloader : public Downloader
             return ((DownloadItem *) userp)->progressCallback(dltotal, dlnow);
         }
 
+        static int debugCallback(CURL * handle, curl_infotype type, char * data, size_t size, void * userptr)
+        {
+            if (type == CURLINFO_TEXT)
+                vomit("curl: %s", chomp(std::string(data, size)));
+            return 0;
+        }
+
         void init()
         {
             // FIXME: handle parallel downloads.
@@ -184,13 +211,23 @@ struct CurlDownloader : public Downloader
             if (!req) req = curl_easy_init();
 
             curl_easy_reset(req);
+
+            if (verbosity >= lvlVomit) {
+                curl_easy_setopt(req, CURLOPT_VERBOSE, 1);
+                curl_easy_setopt(req, CURLOPT_DEBUGFUNCTION, DownloadItem::debugCallback);
+            }
+
             curl_easy_setopt(req, CURLOPT_URL, request.uri.c_str());
             curl_easy_setopt(req, CURLOPT_FOLLOWLOCATION, 1L);
             curl_easy_setopt(req, CURLOPT_NOSIGNAL, 1);
-            curl_easy_setopt(req, CURLOPT_USERAGENT, ("Nix/" + nixVersion).c_str());
+            curl_easy_setopt(req, CURLOPT_USERAGENT, ("curl/" LIBCURL_VERSION " Nix/" + nixVersion).c_str());
+            #if LIBCURL_VERSION_NUM >= 0x072b00
             curl_easy_setopt(req, CURLOPT_PIPEWAIT, 1);
+            #endif
+            #if LIBCURL_VERSION_NUM >= 0x072f00
             if (downloader.enableHttp2)
                 curl_easy_setopt(req, CURLOPT_HTTP_VERSION, CURL_HTTP_VERSION_2TLS);
+            #endif
             curl_easy_setopt(req, CURLOPT_WRITEFUNCTION, DownloadItem::writeCallbackWrapper);
             curl_easy_setopt(req, CURLOPT_WRITEDATA, this);
             curl_easy_setopt(req, CURLOPT_HEADERFUNCTION, DownloadItem::headerCallbackWrapper);
@@ -206,11 +243,16 @@ struct CurlDownloader : public Downloader
                 curl_easy_setopt(req, CURLOPT_NOBODY, 1);
 
             if (request.verifyTLS)
-                curl_easy_setopt(req, CURLOPT_CAINFO, getEnv("SSL_CERT_FILE", "/etc/ssl/certs/ca-certificates.crt").c_str());
+                curl_easy_setopt(req, CURLOPT_CAINFO, settings.caFile.c_str());
             else {
                 curl_easy_setopt(req, CURLOPT_SSL_VERIFYPEER, 0);
                 curl_easy_setopt(req, CURLOPT_SSL_VERIFYHOST, 0);
             }
+
+            /* If no file exist in the specified path, curl continues to work
+               anyway as if netrc support was disabled. */
+            curl_easy_setopt(req, CURLOPT_NETRC_FILE, settings.netrcFile.c_str());
+            curl_easy_setopt(req, CURLOPT_NETRC, CURL_NETRC_OPTIONAL);
 
             result.data = std::make_shared<std::string>();
         }
@@ -242,14 +284,26 @@ struct CurlDownloader : public Downloader
             {
                 result.cached = httpStatus == 304;
                 done = true;
-                callSuccess(success, failure, const_cast<const DownloadResult &>(result));
+
+                try {
+                    result.data = decodeContent(encoding, ref<std::string>(result.data));
+                    callSuccess(success, failure, const_cast<const DownloadResult &>(result));
+                } catch (...) {
+                    done = true;
+                    callFailure(failure, std::current_exception());
+                }
             } else {
                 Error err =
                     (httpStatus == 404 || code == CURLE_FILE_COULDNT_READ_FILE) ? NotFound :
                     httpStatus == 403 ? Forbidden :
                     (httpStatus == 408 || httpStatus == 500 || httpStatus == 503
                         || httpStatus == 504  || httpStatus == 522 || httpStatus == 524
-                        || code == CURLE_COULDNT_RESOLVE_HOST) ? Transient :
+                        || code == CURLE_COULDNT_RESOLVE_HOST
+                        || code == CURLE_RECV_ERROR
+#if LIBCURL_VERSION_NUM >= 0x073200
+                        || code == CURLE_HTTP2_STREAM
+#endif
+                        ) ? Transient :
                     Misc;
 
                 attempt++;
@@ -258,7 +312,7 @@ struct CurlDownloader : public Downloader
                     code == CURLE_ABORTED_BY_CALLBACK && _isInterrupted
                     ? DownloadError(Interrupted, format("download of ‘%s’ was interrupted") % request.uri)
                     : httpStatus != 0
-                      ? DownloadError(err, format("unable to download ‘%s’: HTTP error %d") % request.uri % httpStatus)
+                      ? DownloadError(err, format("unable to download ‘%s’: HTTP error %d (curl error: %s)") % request.uri % httpStatus % curl_easy_strerror(code))
                       : DownloadError(err, format("unable to download ‘%s’: %s (%d)") % request.uri % curl_easy_strerror(code) % code);
 
                 /* If this is a transient error, then maybe retry the
@@ -277,8 +331,13 @@ struct CurlDownloader : public Downloader
 
     struct State
     {
+        struct EmbargoComparator {
+            bool operator() (const std::shared_ptr<DownloadItem> & i1, const std::shared_ptr<DownloadItem> & i2) {
+                return i1->embargo > i2->embargo;
+            }
+        };
         bool quit = false;
-        std::vector<std::shared_ptr<DownloadItem>> incoming;
+        std::priority_queue<std::shared_ptr<DownloadItem>, std::vector<std::shared_ptr<DownloadItem>>, EmbargoComparator> incoming;
     };
 
     Sync<State> state_;
@@ -291,13 +350,16 @@ struct CurlDownloader : public Downloader
     std::thread workerThread;
 
     CurlDownloader()
+        : mt19937(rd())
     {
         static std::once_flag globalInit;
         std::call_once(globalInit, curl_global_init, CURL_GLOBAL_ALL);
 
         curlm = curl_multi_init();
 
+        #if LIBCURL_VERSION_NUM >= 0x072b00 // correct?
         curl_multi_setopt(curlm, CURLMOPT_PIPELINING, CURLPIPE_MULTIPLEX);
+        #endif
         curl_multi_setopt(curlm, CURLMOPT_MAX_TOTAL_CONNECTIONS,
             settings.get("binary-caches-parallel-connections", 25));
 
@@ -311,23 +373,33 @@ struct CurlDownloader : public Downloader
 
     ~CurlDownloader()
     {
-        /* Signal the worker thread to exit. */
-        {
-            auto state(state_.lock());
-            state->quit = true;
-        }
-        writeFull(wakeupPipe.writeSide.get(), " ");
+        stopWorkerThread();
 
         workerThread.join();
 
         if (curlm) curl_multi_cleanup(curlm);
     }
 
+    void stopWorkerThread()
+    {
+        /* Signal the worker thread to exit. */
+        {
+            auto state(state_.lock());
+            state->quit = true;
+        }
+        writeFull(wakeupPipe.writeSide.get(), " ", false);
+    }
+
     void workerThreadMain()
     {
+        /* Cause this thread to be notified on SIGINT. */
+        auto callback = createInterruptCallback([&]() {
+            stopWorkerThread();
+        });
+
         std::map<CURL *, std::shared_ptr<DownloadItem>> items;
 
-        bool quit;
+        bool quit = false;
 
         std::chrono::steady_clock::time_point nextWakeup;
 
@@ -364,7 +436,7 @@ struct CurlDownloader : public Downloader
                 nextWakeup != std::chrono::steady_clock::time_point()
                 ? std::max(0, (int) std::chrono::duration_cast<std::chrono::milliseconds>(nextWakeup - std::chrono::steady_clock::now()).count())
                 : 1000000000;
-            //printMsg(lvlVomit, format("download thread waiting for %d ms") % sleepTimeMs);
+            vomit("download thread waiting for %d ms", sleepTimeMs);
             mc = curl_multi_wait(curlm, extraFDs, 1, sleepTimeMs, &numfds);
             if (mc != CURLM_OK)
                 throw nix::Error(format("unexpected error from curl_multi_wait(): %s") % curl_multi_strerror(mc));
@@ -373,9 +445,7 @@ struct CurlDownloader : public Downloader
 
             /* Add new curl requests from the incoming requests queue,
                except for requests that are embargoed (waiting for a
-               retry timeout to expire). FIXME: should use a priority
-               queue for the embargoed items to prevent repeated O(n)
-               checks. */
+               retry timeout to expire). */
             if (extraFDs[0].revents & CURL_WAIT_POLLIN) {
                 char buf[1024];
                 auto res = read(extraFDs[0].fd, buf, sizeof(buf));
@@ -383,22 +453,23 @@ struct CurlDownloader : public Downloader
                     throw SysError("reading curl wakeup socket");
             }
 
-            std::vector<std::shared_ptr<DownloadItem>> incoming, embargoed;
+            std::vector<std::shared_ptr<DownloadItem>> incoming;
             auto now = std::chrono::steady_clock::now();
 
             {
                 auto state(state_.lock());
-                for (auto & item: state->incoming) {
-                    if (item->embargo <= now)
+                while (!state->incoming.empty()) {
+                    auto item = state->incoming.top();
+                    if (item->embargo <= now) {
                         incoming.push_back(item);
-                    else {
-                        embargoed.push_back(item);
+                        state->incoming.pop();
+                    } else {
                         if (nextWakeup == std::chrono::steady_clock::time_point()
                             || item->embargo < nextWakeup)
                             nextWakeup = item->embargo;
+                        break;
                     }
                 }
-                state->incoming = embargoed;
                 quit = state->quit;
             }
 
@@ -425,7 +496,7 @@ struct CurlDownloader : public Downloader
 
         {
             auto state(state_.lock());
-            state->incoming.clear();
+            while (!state->incoming.empty()) state->incoming.pop();
             state->quit = true;
         }
     }
@@ -436,7 +507,7 @@ struct CurlDownloader : public Downloader
             auto state(state_.lock());
             if (state->quit)
                 throw nix::Error("cannot enqueue download request because the download thread is shutting down");
-            state->incoming.push_back(item);
+            state->incoming.push(item);
         }
         writeFull(wakeupPipe.writeSide.get(), " ");
     }
@@ -445,6 +516,31 @@ struct CurlDownloader : public Downloader
         std::function<void(const DownloadResult &)> success,
         std::function<void(std::exception_ptr exc)> failure) override
     {
+        /* Ugly hack to support s3:// URIs. */
+        if (hasPrefix(request.uri, "s3://")) {
+            // FIXME: do this on a worker thread
+            sync2async<DownloadResult>(success, failure, [&]() -> DownloadResult {
+#ifdef ENABLE_S3
+                S3Helper s3Helper(Aws::Region::US_EAST_1); // FIXME: make configurable
+                auto slash = request.uri.find('/', 5);
+                if (slash == std::string::npos)
+                    throw nix::Error("bad S3 URI ‘%s’", request.uri);
+                std::string bucketName(request.uri, 5, slash - 5);
+                std::string key(request.uri, slash + 1);
+                // FIXME: implement ETag
+                auto s3Res = s3Helper.getObject(bucketName, key);
+                DownloadResult res;
+                if (!s3Res.data)
+                    throw DownloadError(NotFound, fmt("S3 object ‘%s’ does not exist", request.uri));
+                res.data = s3Res.data;
+                return res;
+#else
+                throw nix::Error("cannot download ‘%s’ because Nix is not built with S3 support", request.uri);
+#endif
+            });
+            return;
+        }
+
         auto item = std::make_shared<DownloadItem>(*this, request);
         item->success = success;
         item->failure = failure;
@@ -546,7 +642,8 @@ Path Downloader::downloadCached(ref<Store> store, const string & url_, bool unpa
                 Hash hash = hashString(expectedHash ? expectedHash.type : htSHA256, *res.data);
                 info.path = store->makeFixedOutputPath(false, hash, name);
                 info.narHash = hashString(htSHA256, *sink.s);
-                store->addToStore(info, *sink.s, false, true);
+                info.ca = makeFixedOutputCA(false, hash);
+                store->addToStore(info, sink.s, false, true);
                 storePath = info.path;
             }
 
@@ -574,7 +671,7 @@ Path Downloader::downloadCached(ref<Store> store, const string & url_, bool unpa
             Path tmpDir = createTempDir();
             AutoDelete autoDelete(tmpDir, true);
             // FIXME: this requires GNU tar for decompression.
-            runProgram("tar", true, {"xf", storePath, "-C", tmpDir, "--strip-components", "1"}, "");
+            runProgram("tar", true, {"xf", storePath, "-C", tmpDir, "--strip-components", "1"});
             unpackedStorePath = store->addToStore(name, tmpDir, true, htSHA256, defaultPathFilter, false);
         }
         replaceSymlink(unpackedStorePath, unpackedLink);
@@ -594,7 +691,7 @@ bool isUri(const string & s)
     size_t pos = s.find("://");
     if (pos == string::npos) return false;
     string scheme(s, 0, pos);
-    return scheme == "http" || scheme == "https" || scheme == "file" || scheme == "channel" || scheme == "git";
+    return scheme == "http" || scheme == "https" || scheme == "file" || scheme == "channel" || scheme == "git" || scheme == "s3";
 }
 
 
